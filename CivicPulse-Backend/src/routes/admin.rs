@@ -107,6 +107,6 @@ pub async fn reject_post(
         )
         .await?
         .ok_or_else(|| AppError::not_found(format!("Post '{id}' not found")))?;
-    state.publish_event("post_rejected", &updated);
+    state.publish_redacted_event("post_rejected", &updated);
     Ok(Json(updated))
 }

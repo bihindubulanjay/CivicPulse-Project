@@ -31,33 +31,53 @@ pub const fn status_from_ai_score(score: u8) -> VerificationStatus {
 }
 
 /// Crowd Quorum upgrade when community confirmations reach 3+.
+/// Preserves moderation & terminal states (`Admin Approved`, `Pending Admin Approval`, `Rejected`, `Quarantined`, `Disputed`).
 pub const fn status_after_verify(
     current: VerificationStatus,
     confirmations: u32,
 ) -> VerificationStatus {
-    if confirmations >= 3 {
-        VerificationStatus::CommunityVerified
-    } else {
-        current
+    match current {
+        VerificationStatus::AdminApproved
+        | VerificationStatus::PendingAdminApproval
+        | VerificationStatus::Rejected
+        | VerificationStatus::Quarantined
+        | VerificationStatus::Disputed => current,
+        VerificationStatus::Unverified
+        | VerificationStatus::PendingCommunityVerification
+        | VerificationStatus::AiVerified
+        | VerificationStatus::CommunityVerified => {
+            if confirmations >= 3 {
+                VerificationStatus::CommunityVerified
+            } else {
+                current
+            }
+        }
     }
 }
 
 /// Crowd Quorum flag rule when false_flags reach 3+:
-/// If `is_live_captured && ai_authenticity_score > 80` -> `Disputed`, else -> `Quarantined`.
+/// Preserves hidden/quarantined states, escalates `Admin Approved` to `Disputed`,
+/// and otherwise sets `Disputed` if `is_live_captured && ai_authenticity_score > 80` else `Quarantined`.
 pub const fn status_after_flag(
     current: VerificationStatus,
     false_flags: u32,
     is_live_captured: bool,
     ai_authenticity_score: u8,
 ) -> VerificationStatus {
-    if false_flags >= 3 {
-        if is_live_captured && ai_authenticity_score > 80 {
-            VerificationStatus::Disputed
-        } else {
-            VerificationStatus::Quarantined
+    match current {
+        VerificationStatus::PendingAdminApproval
+        | VerificationStatus::Rejected
+        | VerificationStatus::Quarantined => current,
+        _ if false_flags >= 3 => {
+            if matches!(current, VerificationStatus::AdminApproved)
+                || (is_live_captured && ai_authenticity_score > 80)
+            {
+                VerificationStatus::Disputed
+            } else {
+                VerificationStatus::Quarantined
+            }
         }
-    } else {
-        current
+        _ => current,
     }
 }
 
@@ -175,6 +195,8 @@ pub async fn process_new_post(
         false_flags: 0,
         is_resolved: false,
         integrity_hash,
+        author_id: None,
+        viewer_vote: None,
         comments: Vec::new(),
         created_at,
     };
@@ -247,5 +269,42 @@ mod tests {
             status_after_flag(VerificationStatus::AiVerified, 3, false, 95),
             VerificationStatus::Quarantined
         );
+        // AdminApproved + >= 3 flags escalates to Disputed even if score <= 80
+        assert_eq!(
+            status_after_flag(VerificationStatus::AdminApproved, 3, false, 60),
+            VerificationStatus::Disputed
+        );
+        // Pending/Rejected/Quarantined remain protected on flag
+        for protected in [
+            VerificationStatus::PendingAdminApproval,
+            VerificationStatus::Rejected,
+            VerificationStatus::Quarantined,
+        ] {
+            assert_eq!(status_after_flag(protected, 5, false, 20), protected);
+        }
+    }
+
+    #[test]
+    fn quorum_verify_preserves_moderation_and_terminal_statuses() {
+        for protected in [
+            VerificationStatus::AdminApproved,
+            VerificationStatus::PendingAdminApproval,
+            VerificationStatus::Rejected,
+            VerificationStatus::Quarantined,
+            VerificationStatus::Disputed,
+        ] {
+            assert_eq!(status_after_verify(protected, 10), protected);
+        }
+
+        for promotable in [
+            VerificationStatus::Unverified,
+            VerificationStatus::PendingCommunityVerification,
+            VerificationStatus::AiVerified,
+        ] {
+            assert_eq!(
+                status_after_verify(promotable, 3),
+                VerificationStatus::CommunityVerified
+            );
+        }
     }
 }

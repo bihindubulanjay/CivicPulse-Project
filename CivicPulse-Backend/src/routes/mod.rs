@@ -5,6 +5,7 @@ pub mod auth;
 pub mod docs;
 pub mod events;
 pub mod export;
+pub mod geocode;
 pub mod posts;
 pub mod uploads;
 
@@ -75,6 +76,8 @@ pub fn create_router(state: AppState) -> Router {
         // AI Tactical Chat, GeoJSON & Analytics
         .route("/api/ai/chat", post(ai::ai_chat))
         .route("/api/export/geojson", get(export::export_geojson))
+        .route("/api/geocode/search", get(geocode::search_places))
+        .route("/api/geocode/reverse", get(geocode::reverse_geocode))
         .route("/api/analytics/hotspots", get(analytics::get_hotspots))
         .route(
             "/api/analytics/route-safety",

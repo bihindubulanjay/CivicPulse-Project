@@ -17,6 +17,7 @@ pub enum AppError {
         retry_after_secs: u64,
         message: String,
     },
+    ServiceUnavailable(String),
     Internal(String),
 }
 
@@ -48,6 +49,10 @@ impl AppError {
         Self::Conflict(msg.into())
     }
 
+    pub fn service_unavailable(msg: impl Into<String>) -> Self {
+        Self::ServiceUnavailable(msg.into())
+    }
+
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::Internal(msg.into())
     }
@@ -61,6 +66,7 @@ impl std::fmt::Display for AppError {
             | Self::Forbidden(msg)
             | Self::NotFound(msg)
             | Self::Conflict(msg)
+            | Self::ServiceUnavailable(msg)
             | Self::Internal(msg) => {
                 write!(f, "{msg}")
             }
@@ -137,6 +143,15 @@ impl IntoResponse for AppError {
                 }
                 res
             }
+            Self::ServiceUnavailable(msg) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorBody {
+                    error: &msg,
+                    code: "SERVICE_UNAVAILABLE",
+                    status: StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                }),
+            )
+                .into_response(),
             Self::Internal(msg) => {
                 tracing::error!(error = %msg, "Internal server error");
                 (

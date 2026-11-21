@@ -262,6 +262,26 @@ impl PostRepository {
                 .map_err(|e| AppError::internal(format!("Migration v3 commit error: {e}")))?;
         }
 
+        if current_version < 4 {
+            let tx = conn
+                .transaction()
+                .map_err(|e| AppError::internal(format!("Migration v4 tx error: {e}")))?;
+            tx.execute_batch(
+                "DELETE FROM post_votes
+                 WHERE id NOT IN (SELECT MIN(id) FROM post_votes GROUP BY post_id, voter_key);
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_post_votes_one_per_voter
+                 ON post_votes(post_id, voter_key);",
+            )
+            .map_err(|e| AppError::internal(format!("Migration v4 SQL error: {e}")))?;
+            tx.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (4, ?1)",
+                params![&now],
+            )
+            .map_err(|e| AppError::internal(format!("Migration v4 record error: {e}")))?;
+            tx.commit()
+                .map_err(|e| AppError::internal(format!("Migration v4 commit error: {e}")))?;
+        }
+
         Ok(())
     }
 
@@ -804,10 +824,55 @@ impl PostRepository {
         .await
     }
 
+    /// Return `{ post_id -> vote_type }` for all votes recorded by `voter_key`.
+    pub async fn get_viewer_votes(&self, voter_key: &str) -> AppResult<HashMap<String, String>> {
+        let voter_key = voter_key.to_string();
+        self.with_conn(move |conn| {
+            let mut stmt = conn
+                .prepare("SELECT post_id, vote_type FROM post_votes WHERE voter_key = ?1")
+                .map_err(|e| AppError::internal(format!("DB viewer votes prepare error: {e}")))?;
+            let rows = stmt
+                .query_map(params![&voter_key], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| AppError::internal(format!("DB viewer votes query error: {e}")))?;
+
+            let mut out = HashMap::new();
+            for row in rows {
+                let (pid, vtype) =
+                    row.map_err(|e| AppError::internal(format!("DB viewer vote decode error: {e}")))?;
+                out.insert(pid, vtype);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Return `"verify"` or `"flag"` if `voter_key` has already voted on `post_id`.
+    pub async fn get_viewer_vote_for_post(
+        &self,
+        post_id: &str,
+        voter_key: &str,
+    ) -> AppResult<Option<String>> {
+        let post_id = post_id.to_string();
+        let voter_key = voter_key.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT vote_type FROM post_votes WHERE post_id = ?1 AND voter_key = ?2",
+                params![&post_id, &voter_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| AppError::internal(format!("DB viewer vote lookup error: {e}")))
+        })
+        .await
+    }
+
     pub async fn increment_verify(
         &self,
         id: &str,
         voter_key: String,
+        voter_user_id: Option<String>,
         strict_unique_voters: bool,
         weight: u32,
     ) -> AppResult<Option<Post>> {
@@ -819,11 +884,23 @@ impl PostRepository {
                 .transaction()
                 .map_err(|e| AppError::internal(format!("Failed to begin verify tx: {e}")))?;
 
-            let Some((confirmations, status_str, author_user_id)): Option<(u32, String, Option<String>)> = tx
+            let Some((confirmations, status_str, is_resolved_int, author_user_id)): Option<(
+                u32,
+                String,
+                i64,
+                Option<String>,
+            )> = tx
                 .query_row(
-                    "SELECT confirmations, verification_status, author_user_id FROM posts WHERE id = ?1",
+                    "SELECT confirmations, verification_status, is_resolved, author_user_id FROM posts WHERE id = ?1",
                     params![&id],
-                    |row| Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, u32>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(|e| AppError::internal(format!("DB read error in verify: {e}")))?
@@ -831,24 +908,31 @@ impl PostRepository {
                 return Ok(None);
             };
 
-            if strict_unique_voters {
-                let inserted = tx
-                    .execute(
-                        "INSERT OR IGNORE INTO post_votes (post_id, voter_key, vote_type, created_at)
-                         VALUES (?1, ?2, 'verify', ?3)",
-                        params![&id, &voter_key, &now_str],
-                    )
-                    .map_err(|e| AppError::internal(format!("DB vote insert error: {e}")))?;
-                if inserted == 0 {
-                    return Err(AppError::conflict(
-                        "You have already verified this report",
-                    ));
-                }
-            }
-
             let current_status = status_str
                 .parse::<VerificationStatus>()
                 .unwrap_or(VerificationStatus::Unverified);
+
+            if matches!(
+                current_status,
+                VerificationStatus::PendingAdminApproval
+                    | VerificationStatus::Rejected
+                    | VerificationStatus::Quarantined
+            ) {
+                return Err(AppError::conflict(format!(
+                    "Cannot confirm a report with status '{current_status}'"
+                )));
+            }
+            if is_resolved_int != 0 {
+                return Err(AppError::conflict("Cannot confirm a resolved report"));
+            }
+            if author_user_id.is_some() && author_user_id == voter_user_id {
+                return Err(AppError::forbidden("You cannot confirm your own report"));
+            }
+
+            if strict_unique_voters {
+                record_unique_vote(&tx, &id, &voter_key, "verify", &now_str)?;
+            }
+
             let next_confirmations = confirmations.saturating_add(weight);
             let next_status = status_after_verify(current_status, next_confirmations);
 
@@ -880,7 +964,13 @@ impl PostRepository {
             tx.commit()
                 .map_err(|e| AppError::internal(format!("DB commit error in verify: {e}")))?;
 
-            fetch_post_by_id(conn, &id)
+            let mut post = fetch_post_by_id(conn, &id)?;
+            if let Some(ref mut p) = post {
+                if strict_unique_voters {
+                    p.viewer_vote = Some("verify".to_string());
+                }
+            }
+            Ok(post)
         })
         .await
     }
@@ -889,6 +979,7 @@ impl PostRepository {
         &self,
         id: &str,
         voter_key: String,
+        voter_user_id: Option<String>,
         strict_unique_voters: bool,
     ) -> AppResult<Option<Post>> {
         let id = id.to_string();
@@ -925,24 +1016,28 @@ impl PostRepository {
                 return Ok(None);
             };
 
-            if strict_unique_voters {
-                let inserted = tx
-                    .execute(
-                        "INSERT OR IGNORE INTO post_votes (post_id, voter_key, vote_type, created_at)
-                         VALUES (?1, ?2, 'flag', ?3)",
-                        params![&id, &voter_key, &now_str],
-                    )
-                    .map_err(|e| AppError::internal(format!("DB vote insert error: {e}")))?;
-                if inserted == 0 {
-                    return Err(AppError::conflict(
-                        "You have already flagged this report",
-                    ));
-                }
-            }
-
             let current_status = status_str
                 .parse::<VerificationStatus>()
                 .unwrap_or(VerificationStatus::Unverified);
+
+            if matches!(
+                current_status,
+                VerificationStatus::PendingAdminApproval
+                    | VerificationStatus::Rejected
+                    | VerificationStatus::Quarantined
+            ) {
+                return Err(AppError::conflict(format!(
+                    "Cannot flag a report with status '{current_status}'"
+                )));
+            }
+            if author_user_id.is_some() && author_user_id == voter_user_id {
+                return Err(AppError::forbidden("You cannot flag your own report"));
+            }
+
+            if strict_unique_voters {
+                record_unique_vote(&tx, &id, &voter_key, "flag", &now_str)?;
+            }
+
             let next_flags = false_flags.saturating_add(1);
             let is_live_captured = is_live_int != 0;
             let next_status =
@@ -976,7 +1071,13 @@ impl PostRepository {
             tx.commit()
                 .map_err(|e| AppError::internal(format!("DB commit error in flag: {e}")))?;
 
-            fetch_post_by_id(conn, &id)
+            let mut post = fetch_post_by_id(conn, &id)?;
+            if let Some(ref mut p) = post {
+                if strict_unique_voters {
+                    p.viewer_vote = Some("flag".to_string());
+                }
+            }
+            Ok(post)
         })
         .await
     }
@@ -998,7 +1099,7 @@ impl PostRepository {
                 .transaction()
                 .map_err(|e| AppError::internal(format!("Failed to begin moderation tx: {e}")))?;
 
-            let Some((prev_status, author_user_id)): Option<(String, Option<String>)> = tx
+            let Some((prev_status_str, author_user_id)): Option<(String, Option<String>)> = tx
                 .query_row(
                     "SELECT verification_status, author_user_id FROM posts WHERE id = ?1",
                     params![&id],
@@ -1009,6 +1110,15 @@ impl PostRepository {
             else {
                 return Ok(None);
             };
+
+            let prev_status = prev_status_str
+                .parse::<VerificationStatus>()
+                .unwrap_or(VerificationStatus::Unverified);
+            if prev_status == new_status {
+                tx.commit()
+                    .map_err(|e| AppError::internal(format!("DB commit error in moderation: {e}")))?;
+                return fetch_post_by_id(conn, &id);
+            }
 
             tx.execute(
                 "UPDATE posts SET verification_status = ?1, needs_ai_retry = 0 WHERE id = ?2",
@@ -1035,7 +1145,7 @@ impl PostRepository {
                     "admin='{}', status='{}' (was '{}')",
                     admin_email,
                     new_status.as_str(),
-                    prev_status
+                    prev_status_str
                 ),
                 &now_str,
             )?;
@@ -1048,25 +1158,51 @@ impl PostRepository {
         .await
     }
 
-    pub async fn toggle_resolve(&self, id: &str) -> AppResult<Option<Post>> {
+    pub async fn toggle_resolve(
+        &self,
+        id: &str,
+        actor_user_id: &str,
+        actor_role: UserRole,
+        actor_label: &str,
+    ) -> AppResult<Option<Post>> {
         let id = id.to_string();
+        let actor_user_id = actor_user_id.to_string();
+        let actor_label = actor_label.to_string();
         let now_str = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
         self.with_conn(move |conn| {
             let tx = conn
                 .transaction()
                 .map_err(|e| AppError::internal(format!("Failed to begin resolve tx: {e}")))?;
 
-            let Some(current_int): Option<i64> = tx
+            let Some((current_int, status_str, author_user_id)): Option<(
+                i64,
+                String,
+                Option<String>,
+            )> = tx
                 .query_row(
-                    "SELECT is_resolved FROM posts WHERE id = ?1",
+                    "SELECT is_resolved, verification_status, author_user_id FROM posts WHERE id = ?1",
                     params![&id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()
                 .map_err(|e| AppError::internal(format!("DB read error in resolve: {e}")))?
             else {
                 return Ok(None);
             };
+
+            let status = status_str
+                .parse::<VerificationStatus>()
+                .unwrap_or(VerificationStatus::Unverified);
+            if status.is_hidden_from_public() {
+                return Err(AppError::conflict(
+                    "Cannot resolve an unpublished or rejected report",
+                ));
+            }
+            if actor_role != UserRole::Admin && author_user_id.as_deref() != Some(actor_user_id.as_str()) {
+                return Err(AppError::forbidden(
+                    "Only the report author or an administrator can resolve or reopen this incident",
+                ));
+            }
 
             let next_int: i64 = if current_int == 0 { 1 } else { 0 };
             tx.execute(
@@ -1079,7 +1215,7 @@ impl PostRepository {
                 &tx,
                 &id,
                 "post_resolved_toggled",
-                &format!("is_resolved={}", next_int != 0),
+                &format!("actor={actor_label}, is_resolved={}", next_int != 0),
                 &now_str,
             )?;
 
@@ -1098,17 +1234,30 @@ impl PostRepository {
                 .transaction()
                 .map_err(|e| AppError::internal(format!("Failed to begin comment tx: {e}")))?;
 
-            let exists: Option<String> = tx
+            let Some(status_str): Option<String> = tx
                 .query_row(
-                    "SELECT id FROM posts WHERE id = ?1",
+                    "SELECT verification_status FROM posts WHERE id = ?1",
                     params![&post_id],
                     |row| row.get(0),
                 )
                 .optional()
-                .map_err(|e| AppError::internal(format!("DB read error in comment: {e}")))?;
-
-            if exists.is_none() {
+                .map_err(|e| AppError::internal(format!("DB read error in comment: {e}")))?
+            else {
                 return Ok(None);
+            };
+
+            let status = status_str
+                .parse::<VerificationStatus>()
+                .unwrap_or(VerificationStatus::Unverified);
+            if matches!(
+                status,
+                VerificationStatus::PendingAdminApproval
+                    | VerificationStatus::Rejected
+                    | VerificationStatus::Quarantined
+            ) {
+                return Err(AppError::conflict(
+                    "Cannot comment on a report that is pending approval, quarantined, or rejected",
+                ));
             }
 
             tx.execute(
@@ -1196,7 +1345,7 @@ impl PostRepository {
                         location_name, media_url, is_live_captured, is_on_site,
                         ai_authenticity_score, ai_reasoning, travel_advisory, severity,
                         verification_status, confirmations, false_flags, is_resolved,
-                        integrity_hash, created_at
+                        integrity_hash, created_at, author_user_id
                      FROM posts
                      WHERE needs_ai_retry = 1
                      ORDER BY created_at ASC
@@ -1397,6 +1546,47 @@ fn adjust_user_reputation(conn: &Connection, user_id: &str, delta: i64) -> AppRe
     Ok(())
 }
 
+fn record_unique_vote(
+    conn: &Connection,
+    post_id: &str,
+    voter_key: &str,
+    vote_type: &str,
+    now_str: &str,
+) -> AppResult<()> {
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT vote_type FROM post_votes WHERE post_id = ?1 AND voter_key = ?2",
+            params![post_id, voter_key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| AppError::internal(format!("DB vote lookup error: {e}")))?;
+
+    if let Some(prev) = existing {
+        let msg = match (prev.as_str(), vote_type) {
+            ("verify", "verify") => "You have already confirmed this report",
+            ("flag", "verify") => "You have already flagged this report and cannot confirm it",
+            ("flag", "flag") => "You have already flagged this report",
+            ("verify", "flag") => "You have already confirmed this report and cannot flag it",
+            _ => "You have already voted on this report",
+        };
+        return Err(AppError::conflict(msg));
+    }
+
+    let inserted = conn
+        .execute(
+            "INSERT OR IGNORE INTO post_votes (post_id, voter_key, vote_type, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![post_id, voter_key, vote_type, now_str],
+        )
+        .map_err(|e| AppError::internal(format!("DB vote insert error: {e}")))?;
+
+    if inserted == 0 {
+        return Err(AppError::conflict("You have already voted on this report"));
+    }
+    Ok(())
+}
+
 fn fts5_search_ids(conn: &Connection, raw_query: &str) -> Option<HashSet<String>> {
     let tokens: Vec<String> = raw_query
         .split_whitespace()
@@ -1554,7 +1744,7 @@ fn fetch_all_posts_with_fingerprints(conn: &Connection) -> AppResult<Vec<PostWit
                 location_name, media_url, is_live_captured, is_on_site,
                 ai_authenticity_score, ai_reasoning, travel_advisory, severity,
                 verification_status, confirmations, false_flags, is_resolved,
-                integrity_hash, created_at, media_hash, media_dhash
+                integrity_hash, created_at, author_user_id, media_hash, media_dhash
              FROM posts
              ORDER BY created_at DESC, rowid DESC",
         )
@@ -1563,8 +1753,8 @@ fn fetch_all_posts_with_fingerprints(conn: &Connection) -> AppResult<Vec<PostWit
     let rows = stmt
         .query_map([], |row| {
             let post = row_to_post(row)?;
-            let media_hash: Option<String> = row.get(21)?;
-            let media_dhash: Option<String> = row.get(22)?;
+            let media_hash: Option<String> = row.get(22)?;
+            let media_dhash: Option<String> = row.get(23)?;
             Ok((post, media_hash, media_dhash))
         })
         .map_err(|e| AppError::internal(format!("Failed to query posts: {e}")))?;
@@ -1590,7 +1780,7 @@ fn fetch_post_by_id(conn: &Connection, id: &str) -> AppResult<Option<Post>> {
                 location_name, media_url, is_live_captured, is_on_site,
                 ai_authenticity_score, ai_reasoning, travel_advisory, severity,
                 verification_status, confirmations, false_flags, is_resolved,
-                integrity_hash, created_at
+                integrity_hash, created_at, author_user_id
              FROM posts WHERE id = ?1",
             params![id],
             row_to_post,
@@ -1692,6 +1882,8 @@ fn row_to_post(row: &rusqlite::Row<'_>) -> rusqlite::Result<Post> {
         false_flags: row.get(17)?,
         is_resolved: row.get::<_, i64>(18)? != 0,
         integrity_hash: row.get(19)?,
+        author_id: row.get(21)?,
+        viewer_vote: None,
         comments: Vec::new(),
         created_at: row.get(20)?,
     })

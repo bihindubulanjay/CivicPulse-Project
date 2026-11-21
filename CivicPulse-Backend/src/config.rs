@@ -102,7 +102,7 @@ impl Config {
 
         let rate_limit_post_per_min = parse_usize("RATE_LIMIT_POST_PER_MIN", 10).max(1);
         let auth_rate_limit_per_15min = parse_usize("AUTH_RATE_LIMIT_PER_15MIN", 15).max(1);
-        let strict_unique_voters = parse_bool("STRICT_UNIQUE_VOTERS", false);
+        let strict_unique_voters = parse_bool("STRICT_UNIQUE_VOTERS", true);
         let session_ttl_hours = parse_i64("SESSION_TTL_HOURS", 24).clamp(1, 8760);
         let allow_guest_uploads_default = parse_bool("ALLOW_GUEST_UPLOADS_DEFAULT", true);
         let seed_initial_posts = parse_bool("SEED_INITIAL_POSTS", true);
@@ -189,7 +189,7 @@ impl Config {
             geofence_radius_km: 15.0,
             rate_limit_post_per_min: 10,
             auth_rate_limit_per_15min: 15,
-            strict_unique_voters: false,
+            strict_unique_voters: true,
             session_ttl_hours: 24,
             allow_guest_uploads_default: true,
             seed_initial_posts: true,

@@ -240,6 +240,8 @@ pub fn initial_seed_posts() -> Vec<Post> {
                 false_flags: s.false_flags,
                 is_resolved: s.is_resolved,
                 integrity_hash,
+                author_id: None,
+                viewer_vote: None,
                 comments: s
                     .comments
                     .into_iter()

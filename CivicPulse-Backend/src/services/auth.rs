@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{str::FromStr, sync::OnceLock};
 
 use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
@@ -90,6 +90,7 @@ pub struct ChangePasswordRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthResponse {
+    pub user_id: String,
     pub token: String,
     pub role: UserRole,
     pub name: String,
@@ -100,6 +101,7 @@ pub struct AuthResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurrentUserResponse {
+    pub user_id: String,
     pub role: UserRole,
     pub name: String,
     pub email: String,
@@ -193,23 +195,29 @@ impl AuthService {
             return Err(AppError::unauthorized("Invalid email or password"));
         }
 
-        let Some(user) = self.repo.get_user_by_email(&email).await? else {
-            return Err(AppError::unauthorized("Invalid email or password"));
-        };
+        let maybe_user = self.repo.get_user_by_email(&email).await?;
+        let dummy_hash = dummy_argon2_hash()?.to_string();
 
-        let valid = tokio::task::spawn_blocking({
+        let (pw_ok, found_user) = tokio::task::spawn_blocking({
             let pw = req.password.clone();
-            let stored_hash = user.password_hash.clone();
-            move || verify_password_argon2id(&pw, &stored_hash)
+            move || match maybe_user {
+                Some(user) => {
+                    let ok = verify_password_argon2id(&pw, &user.password_hash);
+                    (ok, Some(user))
+                }
+                None => {
+                    let _ = verify_password_argon2id(&pw, &dummy_hash);
+                    (false, None)
+                }
+            }
         })
         .await
         .map_err(|e| AppError::internal(format!("Argon2 verify join error: {e}")))?;
 
-        if !valid {
-            return Err(AppError::unauthorized("Invalid email or password"));
+        match (pw_ok, found_user) {
+            (true, Some(user)) => self.create_session_for_user(&user).await,
+            _ => Err(AppError::unauthorized("Invalid email or password")),
         }
-
-        self.create_session_for_user(&user).await
     }
 
     pub async fn logout(&self, headers: &HeaderMap) -> AppResult<()> {
@@ -270,6 +278,7 @@ impl AuthService {
             .await?;
 
         Ok(AuthResponse {
+            user_id: user.id.clone(),
             token: raw_token,
             role: user.role,
             name: user.name.clone(),
@@ -355,11 +364,67 @@ pub fn hash_token(raw_token: &str) -> String {
     hex::encode(digest)
 }
 
+fn dummy_argon2_hash() -> AppResult<&'static str> {
+    static DUMMY: OnceLock<String> = OnceLock::new();
+    if let Some(existing) = DUMMY.get() {
+        return Ok(existing.as_str());
+    }
+    let generated = hash_password_argon2id("civicpulse-dummy-timing-guard")?;
+    let _ = DUMMY.set(generated);
+    Ok(DUMMY
+        .get()
+        .map(String::as_str)
+        .unwrap_or("$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"))
+}
+
 fn normalize_email(raw: &str) -> AppResult<String> {
     let email = sanitize_text(raw).to_ascii_lowercase();
-    if email.len() < 5 || email.len() > 254 || !email.contains('@') || email.contains(' ') {
+    if email.len() < 5
+        || email.len() > 254
+        || email.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
         return Err(AppError::bad_request("Please provide a valid email address"));
     }
+
+    let Some((local, domain)) = email.split_once('@') else {
+        return Err(AppError::bad_request("Please provide a valid email address"));
+    };
+    if domain.contains('@')
+        || local.is_empty()
+        || local.len() > 64
+        || local.starts_with('.')
+        || local.ends_with('.')
+        || local.contains("..")
+    {
+        return Err(AppError::bad_request("Please provide a valid email address"));
+    }
+
+    if domain.len() > 253
+        || !domain.contains('.')
+        || domain.starts_with('.')
+        || domain.ends_with('.')
+        || domain.contains("..")
+    {
+        return Err(AppError::bad_request("Please provide a valid email address"));
+    }
+
+    let labels: Vec<&str> = domain.split('.').collect();
+    let valid_labels = labels.iter().all(|label| {
+        !label.is_empty()
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    });
+    let valid_tld = labels
+        .last()
+        .is_some_and(|tld| tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic()));
+
+    if !valid_labels || !valid_tld {
+        return Err(AppError::bad_request("Please provide a valid email address"));
+    }
+
     Ok(email)
 }
 
@@ -412,5 +477,27 @@ mod tests {
 
         auth.logout(&headers).await.unwrap();
         assert!(auth.require_admin(&headers).await.is_err());
+    }
+
+    #[test]
+    fn email_validation_rejects_malformed_addresses() {
+        assert_eq!(
+            normalize_email("  Kasun@Example.COM ").unwrap(),
+            "kasun@example.com"
+        );
+        for bad in [
+            "a@b",
+            "@example.com",
+            "user@",
+            "user@.com",
+            ".user@example.com",
+            "user..name@example.com",
+            "user@sub..example.com",
+            "user@-bad.com",
+            "user@example.123",
+            "two@at@example.com",
+        ] {
+            assert!(normalize_email(bad).is_err(), "expected {bad} to fail");
+        }
     }
 }

@@ -54,4 +54,11 @@ impl AppState {
         };
         let _ = self.events_tx.send(event);
     }
+
+    /// Broadcast an SSE notification without exposing unapproved, quarantined, or rejected post titles.
+    pub fn publish_redacted_event(&self, event_type: &str, post: &Post) {
+        let mut redacted = post.clone();
+        redacted.title.clear();
+        self.publish_event(event_type, &redacted);
+    }
 }

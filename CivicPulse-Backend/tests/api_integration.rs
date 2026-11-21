@@ -371,6 +371,7 @@ async fn crowd_quorum_verify_flag_resolve_comment_chat_and_geojson() {
     let repo = PostRepository::open_in_memory().unwrap();
     let config = Config::for_test(endpoint, Some("test-key".into()));
     let (app, _) = build_app(config, repo).await.unwrap();
+    let admin_token = login_token(&app, "admin@civicpulse.org", "admin123", "203.0.113.8").await;
     let user_token = login_token(&app, "user@civicpulse.org", "user123", "203.0.113.9").await;
 
     // Create a low-score post (< 40) -> auto-Quarantined
@@ -423,16 +424,16 @@ async fn crowd_quorum_verify_flag_resolve_comment_chat_and_geojson() {
         VerificationStatus::CommunityVerified
     );
 
-    // Flag Galle post (0003: is_live_captured=true, ai_authenticity_score=88 > 80) 3 times -> Disputed!
+    // Flag Galle post (0003: is_live_captured=true, ai_authenticity_score=88 > 80) from 3 distinct voters -> Disputed!
     let galle_id = "11111111-1111-4111-8111-000000000003";
-    for _ in 0..3 {
+    for ip in ["203.0.113.12", "203.0.113.22", "203.0.113.32"] {
         let res = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
                     .uri(format!("/api/posts/{galle_id}/flag"))
-                    .header("x-forwarded-for", "203.0.113.12")
+                    .header("x-forwarded-for", ip)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -454,16 +455,16 @@ async fn crowd_quorum_verify_flag_resolve_comment_chat_and_geojson() {
     assert_eq!(galle_post.false_flags, 3);
     assert_eq!(galle_post.verification_status, VerificationStatus::Disputed);
 
-    // Flag Sinharaja post (0004: is_live_captured=false, score=84) 3 times -> Quarantined!
+    // Flag Sinharaja post (0004: is_live_captured=false, score=84) from 3 distinct voters -> Quarantined!
     let sinharaja_id = "11111111-1111-4111-8111-000000000004";
-    for _ in 0..3 {
+    for ip in ["203.0.113.13", "203.0.113.23", "203.0.113.33"] {
         let res = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
                     .uri(format!("/api/posts/{sinharaja_id}/flag"))
-                    .header("x-forwarded-for", "203.0.113.13")
+                    .header("x-forwarded-for", ip)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -487,9 +488,9 @@ async fn crowd_quorum_verify_flag_resolve_comment_chat_and_geojson() {
         VerificationStatus::Quarantined
     );
 
-    // Toggle resolve on Ella (0001)
+    // Toggle resolve on Ella (0001): anonymous returns 401, non-owner user returns 403, Admin succeeds
     let ella_id = "11111111-1111-4111-8111-000000000001";
-    let res1 = app
+    let unauth_resolve = app
         .clone()
         .oneshot(
             Request::builder()
@@ -501,6 +502,37 @@ async fn crowd_quorum_verify_flag_resolve_comment_chat_and_geojson() {
         )
         .await
         .unwrap();
+    assert_eq!(unauth_resolve.status(), StatusCode::UNAUTHORIZED);
+
+    let non_owner_resolve = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/posts/{ella_id}/resolve"))
+                .header(header::AUTHORIZATION, format!("Bearer {user_token}"))
+                .header("x-forwarded-for", "203.0.113.14")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(non_owner_resolve.status(), StatusCode::FORBIDDEN);
+
+    let res1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/posts/{ella_id}/resolve"))
+                .header(header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("x-forwarded-for", "203.0.113.14")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res1.status(), StatusCode::OK);
     let resolved_ella: Post = serde_json::from_value(read_json(res1).await).unwrap();
     assert!(resolved_ella.is_resolved);
 
@@ -596,14 +628,17 @@ async fn ip_rate_limiter_enforces_10_posts_per_minute_over_http() {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri(format!("/api/posts/{target_id}/verify"))
+                    .uri(format!("/api/posts/{target_id}/comment"))
+                    .header(header::CONTENT_TYPE, "application/json")
                     .header("x-forwarded-for", "198.51.100.42")
-                    .body(Body::empty())
+                    .body(Body::from(
+                        json!({ "text": format!("Ground condition update #{i}") }).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::OK, "POST #{i} should succeed");
+        assert_eq!(res.status(), StatusCode::CREATED, "POST #{i} should succeed");
         assert_eq!(
             res.headers()
                 .get("x-ratelimit-remaining")
@@ -620,9 +655,10 @@ async fn ip_rate_limiter_enforces_10_posts_per_minute_over_http() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri(format!("/api/posts/{target_id}/verify"))
+                .uri(format!("/api/posts/{target_id}/comment"))
+                .header(header::CONTENT_TYPE, "application/json")
                 .header("x-forwarded-for", "198.51.100.42")
-                .body(Body::empty())
+                .body(Body::from(json!({ "text": "Blocked 11th POST" }).to_string()))
                 .unwrap(),
         )
         .await
@@ -652,14 +688,15 @@ async fn ip_rate_limiter_enforces_10_posts_per_minute_over_http() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri(format!("/api/posts/{target_id}/verify"))
+                .uri(format!("/api/posts/{target_id}/comment"))
+                .header(header::CONTENT_TYPE, "application/json")
                 .header("x-forwarded-for", "198.51.100.99")
-                .body(Body::empty())
+                .body(Body::from(json!({ "text": "Allowed from second IP" }).to_string()))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(other_ip_ok.status(), StatusCode::OK);
+    assert_eq!(other_ip_ok.status(), StatusCode::CREATED);
 }
 
 #[tokio::test]
@@ -746,6 +783,7 @@ async fn security_headers_magic_bytes_recycled_media_and_audit_trail() {
     let config = Config::for_test(endpoint, Some("test-key".into()));
     let (app, state) = build_app(config, repo).await.unwrap();
     let mut sse_rx = state.events_tx.subscribe();
+    let user_token = login_token(&app, "user@civicpulse.org", "user123", "198.51.100.10").await;
 
     // 1. Reject spoofed MIME (script bytes disguised as JPEG)
     let fake_b64 = BASE64_STANDARD.encode(b"<script>alert('xss')</script>");
@@ -756,6 +794,7 @@ async fn security_headers_magic_bytes_recycled_media_and_audit_trail() {
                 .method(Method::POST)
                 .uri("/api/posts")
                 .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {user_token}"))
                 .header("x-forwarded-for", "198.51.100.1")
                 .body(Body::from(
                     json!({
@@ -789,6 +828,7 @@ async fn security_headers_magic_bytes_recycled_media_and_audit_trail() {
                 .method(Method::POST)
                 .uri("/api/posts")
                 .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {user_token}"))
                 .header("x-forwarded-for", "198.51.100.2")
                 .body(Body::from(
                     json!({
@@ -823,6 +863,7 @@ async fn security_headers_magic_bytes_recycled_media_and_audit_trail() {
                 .method(Method::POST)
                 .uri("/api/posts")
                 .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {user_token}"))
                 .header("x-forwarded-for", "198.51.100.3")
                 .body(Body::from(
                     json!({
@@ -956,7 +997,8 @@ async fn dynamic_geospatial_sort_hotspots_route_safety_and_strict_unique_voters(
     assert_eq!(route_body["overall_advisory"], "Danger");
     assert!(route_body["hazards_on_route"].as_array().unwrap().len() >= 2);
 
-    // Anti-Sybil unique voter guard: same voter blocked with 409, distinct voter succeeds
+    // Anti-Sybil unique voter guard: spoofed X-Client-Id on same IP is blocked (409),
+    // distinct IP succeeds, and authenticated users are deduplicated by account ID across IPs.
     let target = "11111111-1111-4111-8111-000000000005";
     let first_vote = app
         .clone()
@@ -973,34 +1015,67 @@ async fn dynamic_geospatial_sort_hotspots_route_safety_and_strict_unique_voters(
         .unwrap();
     assert_eq!(first_vote.status(), StatusCode::OK);
 
-    let dup_vote = app
+    // Same IP trying a different X-Client-Id cannot bypass vote limit
+    let spoofed_client_dup = app
         .clone()
         .oneshot(
             Request::builder()
                 .method(Method::POST)
                 .uri(format!("/api/posts/{target}/verify"))
-                .header("x-client-id", "device-alpha")
+                .header("x-client-id", "device-spoofed")
+                .header("x-forwarded-for", "198.51.100.60")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(spoofed_client_dup.status(), StatusCode::CONFLICT);
+
+    let second_ip_voter = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/posts/{target}/verify"))
                 .header("x-forwarded-for", "198.51.100.61")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(dup_vote.status(), StatusCode::CONFLICT);
+    assert_eq!(second_ip_voter.status(), StatusCode::OK);
 
-    let second_voter = app
+    // Same authenticated account voting from two different IPs is blocked on second vote
+    let auth_token = login_token(&app, "user@civicpulse.org", "user123", "198.51.100.62").await;
+    let target2 = "11111111-1111-4111-8111-000000000002";
+    let auth_first = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri(format!("/api/posts/{target}/verify"))
-                .header("x-client-id", "device-beta")
+                .uri(format!("/api/posts/{target2}/verify"))
+                .header(header::AUTHORIZATION, format!("Bearer {auth_token}"))
                 .header("x-forwarded-for", "198.51.100.62")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(second_voter.status(), StatusCode::OK);
+    assert_eq!(auth_first.status(), StatusCode::OK);
+
+    let auth_roam_dup = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/posts/{target2}/verify"))
+                .header(header::AUTHORIZATION, format!("Bearer {auth_token}"))
+                .header("x-forwarded-for", "198.51.100.63")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(auth_roam_dup.status(), StatusCode::CONFLICT);
 }
 
 #[tokio::test]
@@ -1878,4 +1953,641 @@ async fn background_ai_retry_and_signed_emergency_webhook_and_proxy_trust() {
     );
     assert_eq!(sig_header, &expected_sig);
     assert!(payload_str.contains(&created.id));
+}
+
+#[tokio::test]
+async fn geocode_endpoints_validate_query_and_coordinates() {
+    let repo = PostRepository::open_in_memory().unwrap();
+    let config = Config::for_test("http://127.0.0.1:9/unused".into(), None);
+    let (app, _state) = build_app(config, repo).await.unwrap();
+
+    // Search query shorter than 2 chars -> 400 Bad Request
+    let short_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/geocode/search?q=a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(short_res.status(), StatusCode::BAD_REQUEST);
+
+    // Search query exceeding 200 chars -> 400 Bad Request
+    let long_q = "x".repeat(201);
+    let long_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/geocode/search?q={long_q}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(long_res.status(), StatusCode::BAD_REQUEST);
+
+    // Out-of-range coordinates on reverse geocode -> 400 Bad Request
+    let bad_reverse = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/geocode/reverse?lat=999&lng=80")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_reverse.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn full_security_audit_prevents_double_vote_self_vote_moderation_bypass_and_unauthorized_resolve(
+) {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let gemini_ok = json!({
+        "ai_authenticity_score": 85,
+        "ai_reasoning": "Legitimate field report.",
+        "translated_description": "Flooding along Kandy road.",
+        "travel_advisory": "Caution",
+        "severity": 6
+    });
+    let endpoint = spawn_gemini_test_server(MockGeminiBehavior {
+        status: StatusCode::OK,
+        response_body: gemini_text_envelope(&gemini_ok.to_string()),
+        captured_requests: Arc::clone(&captured),
+    })
+    .await;
+
+    let repo = PostRepository::open_in_memory().unwrap();
+    let config = Config::for_test(endpoint, Some("test-key".into()));
+    let (app, _) = build_app(config, repo).await.unwrap();
+
+    let admin_token = login_token(&app, "admin@civicpulse.org", "admin123", "198.51.100.200").await;
+    let user_token = login_token(&app, "user@civicpulse.org", "user123", "198.51.100.201").await;
+
+    // Register a second reporter account & confirm malformed email fails
+    let bad_email_reg = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/auth/register")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-forwarded-for", "198.51.100.202")
+                .body(Body::from(
+                    json!({ "name": "Bad", "email": "a@b", "password": "password123" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_email_reg.status(), StatusCode::BAD_REQUEST);
+
+    let reg_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/auth/register")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-forwarded-for", "198.51.100.203")
+                .body(Body::from(
+                    json!({ "name": "Nimali Silva", "email": "nimali@example.com", "password": "password123" })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reg_res.status(), StatusCode::CREATED);
+    let reg_json = read_json(reg_res).await;
+    let nimali_token = reg_json["token"].as_str().unwrap().to_string();
+    let nimali_id = reg_json["user_id"].as_str().unwrap().to_string();
+    assert!(!nimali_id.is_empty());
+
+    // Reporter 1 (`user@civicpulse.org`) creates a post
+    let create_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/posts")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {user_token}"))
+                .header("x-forwarded-for", "198.51.100.204")
+                .body(Body::from(
+                    json!({
+                        "lat": 7.09,
+                        "lng": 80.0,
+                        "title": "Kandy Road Flash Flooding",
+                        "description": "Water rising near junction",
+                        "category": "Road",
+                        "location_name": "Gampaha"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_res.status(), StatusCode::CREATED);
+    let user_post: Post = serde_json::from_value(read_json(create_res).await).unwrap();
+    assert!(user_post.author_id.is_some());
+
+    // Author cannot confirm or flag their own post -> 403 Forbidden
+    let self_confirm = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/posts/{}/verify", user_post.id))
+                .header(header::AUTHORIZATION, format!("Bearer {user_token}"))
+                .header("x-forwarded-for", "198.51.100.205")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(self_confirm.status(), StatusCode::FORBIDDEN);
+
+    let self_flag = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/posts/{}/flag", user_post.id))
+                .header(header::AUTHORIZATION, format!("Bearer {user_token}"))
+                .header("x-forwarded-for", "198.51.100.205")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(self_flag.status(), StatusCode::FORBIDDEN);
+
+    // Nimali confirms user_post once -> 200 OK with viewer_vote = "verify"
+    let first_confirm = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/posts/{}/verify", user_post.id))
+                .header(header::AUTHORIZATION, format!("Bearer {nimali_token}"))
+                .header("x-forwarded-for", "198.51.100.206")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_confirm.status(), StatusCode::OK);
+    let confirmed_post: Post = serde_json::from_value(read_json(first_confirm).await).unwrap();
+    assert_eq!(confirmed_post.viewer_vote.as_deref(), Some("verify"));
+
+    // Confirming again or flagging after confirming -> 409 Conflict
+    let dup_confirm = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/posts/{}/verify", user_post.id))
+                .header(header::AUTHORIZATION, format!("Bearer {nimali_token}"))
+                .header("x-forwarded-for", "198.51.100.206")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dup_confirm.status(), StatusCode::CONFLICT);
+
+    let flip_to_flag = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/posts/{}/flag", user_post.id))
+                .header(header::AUTHORIZATION, format!("Bearer {nimali_token}"))
+                .header("x-forwarded-for", "198.51.100.206")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(flip_to_flag.status(), StatusCode::CONFLICT);
+
+    // GET /api/posts with Nimali's token populates viewer_vote accurately
+    let feed_nimali = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/posts")
+                .header(header::AUTHORIZATION, format!("Bearer {nimali_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(feed_nimali.status(), StatusCode::OK);
+    let nimali_posts: Vec<Post> = serde_json::from_value(read_json(feed_nimali).await).unwrap();
+    let fetched_user_post = nimali_posts.iter().find(|p| p.id == user_post.id).unwrap();
+    assert_eq!(fetched_user_post.viewer_vote.as_deref(), Some("verify"));
+
+    // Flagging first on another post blocks later confirming
+    let seed_ella = "11111111-1111-4111-8111-000000000001";
+    let first_flag = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/posts/{seed_ella}/flag"))
+                .header(header::AUTHORIZATION, format!("Bearer {nimali_token}"))
+                .header("x-forwarded-for", "198.51.100.207")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_flag.status(), StatusCode::OK);
+    let flagged_post: Post = serde_json::from_value(read_json(first_flag).await).unwrap();
+    assert_eq!(flagged_post.viewer_vote.as_deref(), Some("flag"));
+
+    let flip_to_confirm = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/posts/{seed_ella}/verify"))
+                .header(header::AUTHORIZATION, format!("Bearer {nimali_token}"))
+                .header("x-forwarded-for", "198.51.100.207")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(flip_to_confirm.status(), StatusCode::CONFLICT);
+
+    // Invalid Bearer tokens are rejected (not silently treated as guest) -> 401
+    for uri in [
+        format!("/api/posts/{}/verify", user_post.id),
+        format!("/api/posts/{}/flag", user_post.id),
+        format!("/api/posts/{}/comment", user_post.id),
+    ] {
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri(&uri)
+            .header(header::AUTHORIZATION, "Bearer invalid-token-xyz")
+            .header("x-forwarded-for", "198.51.100.208");
+        let body = if uri.ends_with("/comment") {
+            req = req.header(header::CONTENT_TYPE, "application/json");
+            Body::from(json!({ "text": "hello" }).to_string())
+        } else {
+            Body::empty()
+        };
+        let bad_auth = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
+        assert_eq!(bad_auth.status(), StatusCode::UNAUTHORIZED, "expected 401 on {uri}");
+    }
+
+    // Resolve ownership & auth: anonymous 401, non-owner 403, author 200, admin 200
+    let resolve_anon = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/posts/{}/resolve", user_post.id))
+                .header("x-forwarded-for", "198.51.100.209")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resolve_anon.status(), StatusCode::UNAUTHORIZED);
+
+    let resolve_non_owner = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/posts/{}/resolve", user_post.id))
+                .header(header::AUTHORIZATION, format!("Bearer {nimali_token}"))
+                .header("x-forwarded-for", "198.51.100.209")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resolve_non_owner.status(), StatusCode::FORBIDDEN);
+
+    let resolve_owner = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/posts/{}/resolve", user_post.id))
+                .header(header::AUTHORIZATION, format!("Bearer {user_token}"))
+                .header("x-forwarded-for", "198.51.100.209")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resolve_owner.status(), StatusCode::OK);
+    let resolved_post: Post = serde_json::from_value(read_json(resolve_owner).await).unwrap();
+    assert!(resolved_post.is_resolved);
+
+    // Confirming a resolved post returns 409 Conflict
+    let confirm_resolved = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/posts/{}/verify", user_post.id))
+                .header(header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("x-forwarded-for", "198.51.100.210")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(confirm_resolved.status(), StatusCode::CONFLICT);
+
+    // Admin reopens user_post
+    let admin_reopen = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/posts/{}/resolve", user_post.id))
+                .header(header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("x-forwarded-for", "198.51.100.210")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admin_reopen.status(), StatusCode::OK);
+
+    // Guest post privacy + moderation bypass checks
+    let guest_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/posts")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-forwarded-for", "198.51.100.211")
+                .body(Body::from(
+                    json!({
+                        "lat": 6.9,
+                        "lng": 80.1,
+                        "title": "Hidden Guest Incident",
+                        "description": "Pending approval check",
+                        "category": "Nature",
+                        "location_name": "Kegalle"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(guest_res.status(), StatusCode::CREATED);
+    let guest_post: Post = serde_json::from_value(read_json(guest_res).await).unwrap();
+    assert_eq!(
+        guest_post.verification_status,
+        VerificationStatus::PendingAdminApproval
+    );
+
+    // Unauthenticated/other user cannot read Pending Admin Approval post, audit, or integrity; Admin can
+    for hidden_uri in [
+        format!("/api/posts/{}", guest_post.id),
+        format!("/api/posts/{}/verify-integrity", guest_post.id),
+        format!("/api/posts/{}/audit", guest_post.id),
+    ] {
+        let non_admin_get = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&hidden_uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {nimali_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(non_admin_get.status(), StatusCode::NOT_FOUND);
+
+        let admin_get = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&hidden_uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(admin_get.status(), StatusCode::OK);
+    }
+
+    // Cannot vote or comment on Pending Admin Approval post
+    let vote_pending = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/posts/{}/verify", guest_post.id))
+                .header(header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("x-forwarded-for", "198.51.100.212")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(vote_pending.status(), StatusCode::CONFLICT);
+
+    let comment_pending = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/posts/{}/comment", guest_post.id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("x-forwarded-for", "198.51.100.212")
+                .body(Body::from(json!({ "text": "Comment on pending" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(comment_pending.status(), StatusCode::CONFLICT);
+
+    // Admin approves guest post (idempotent if called twice), then verify status never downgrades from AdminApproved
+    let approve1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/admin/posts/{}/approve", guest_post.id))
+                .header(header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("x-forwarded-for", "198.51.100.213")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(approve1.status(), StatusCode::OK);
+
+    let approve2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/admin/posts/{}/approve", guest_post.id))
+                .header(header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("x-forwarded-for", "198.51.100.213")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(approve2.status(), StatusCode::OK);
+
+    // Two confirms on AdminApproved post keep AdminApproved (including 1+2 >= 3 weight)
+    let confirm_approved = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/posts/{}/verify", guest_post.id))
+                .header(header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("x-forwarded-for", "198.51.100.214")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(confirm_approved.status(), StatusCode::OK);
+    let confirm_approved2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/posts/{}/verify", guest_post.id))
+                .header(header::AUTHORIZATION, format!("Bearer {nimali_token}"))
+                .header("x-forwarded-for", "198.51.100.214")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let approved_after_votes: Post =
+        serde_json::from_value(read_json(confirm_approved2).await).unwrap();
+    assert_eq!(approved_after_votes.confirmations, 3);
+    assert_eq!(
+        approved_after_votes.verification_status,
+        VerificationStatus::AdminApproved
+    );
+
+    // Audit log privacy: non-admin sees redacted emails, admin sees raw emails
+    let public_audit_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/posts/{}/audit", user_post.id))
+                .header(header::AUTHORIZATION, format!("Bearer {nimali_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(public_audit_res.status(), StatusCode::OK);
+    let public_audit_str = read_json(public_audit_res).await.to_string();
+    assert!(!public_audit_str.contains("user@civicpulse.org"));
+    assert!(!public_audit_str.contains("admin@civicpulse.org"));
+
+    let admin_audit_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/posts/{}/audit", user_post.id))
+                .header(header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admin_audit_res.status(), StatusCode::OK);
+    let admin_audit_str = read_json(admin_audit_res).await.to_string();
+    assert!(admin_audit_str.contains("user@civicpulse.org"));
+
+    // Comment spoofing & guest upload policy enforcement
+    let spoofed_auth_comment = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/posts/{}/comment", user_post.id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {nimali_token}"))
+                .header("x-forwarded-for", "198.51.100.215")
+                .body(Body::from(
+                    json!({ "author": "CivicPulse Admin", "text": "Confirmed condition" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(spoofed_auth_comment.status(), StatusCode::CREATED);
+    let commented_post: Post =
+        serde_json::from_value(read_json(spoofed_auth_comment).await).unwrap();
+    assert_eq!(commented_post.comments[0].author, "Nimali Silva");
+
+    let guest_admin_spoof = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/posts/{}/comment", user_post.id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-forwarded-for", "198.51.100.216")
+                .body(Body::from(
+                    json!({ "author": "System Admin", "text": "Evacuate" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(guest_admin_spoof.status(), StatusCode::BAD_REQUEST);
+
+    // Toggle guest uploads OFF -> guest comment blocked (403)
+    let disable_guests = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/admin/settings")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .header("x-forwarded-for", "198.51.100.217")
+                .body(Body::from(json!({ "allow_guest_uploads": false }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(disable_guests.status(), StatusCode::OK);
+
+    let guest_comment_blocked = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/posts/{}/comment", user_post.id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-forwarded-for", "198.51.100.218")
+                .body(Body::from(json!({ "text": "Guest note" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(guest_comment_blocked.status(), StatusCode::FORBIDDEN);
 }

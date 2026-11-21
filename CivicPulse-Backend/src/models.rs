@@ -228,6 +228,10 @@ pub struct Post {
     pub false_flags: u32,
     pub is_resolved: bool,
     pub integrity_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewer_vote: Option<String>,
     pub comments: Vec<Comment>,
     pub created_at: String,
 }

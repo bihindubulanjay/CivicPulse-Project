@@ -32,7 +32,14 @@ pub async fn get_hotspots(
         ));
     }
 
-    let all_posts = state.repo.list_posts(&ListPostsQuery::default()).await?;
+    let all_posts = state
+        .repo
+        .list_posts(&ListPostsQuery {
+            exclude_quarantined: Some(true),
+            limit: Some(500),
+            ..Default::default()
+        })
+        .await?;
     let report = compute_network_hotspots(&all_posts, radius, Utc::now());
     Ok(Json(report))
 }

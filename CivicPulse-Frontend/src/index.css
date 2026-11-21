@@ -1,0 +1,167 @@
+@import 'leaflet/dist/leaflet.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    font-family: 'Plus Jakarta Sans', ui-sans-serif, system-ui, sans-serif;
+    background: #f8fafc;
+    color: #0f172a;
+  }
+}
+
+/* Glassmorphism surfaces */
+.glass-panel {
+  background: rgba(255, 255, 255, 0.86);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid rgba(226, 232, 240, 0.9);
+}
+
+/* Native <dialog> modal rules (prevent-page-scroll-under-modal-dialog + dialog guides) */
+dialog.cp-dialog {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  max-width: min(96vw, 48rem);
+  max-height: min(92dvh, 52rem);
+  margin: auto;
+  overflow: visible;
+}
+
+dialog.cp-dialog[open] {
+  display: flex;
+  flex-direction: column;
+  animation: cp-dialog-enter 180ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+dialog.cp-dialog:modal {
+  overscroll-behavior: contain;
+}
+
+dialog.cp-dialog::backdrop {
+  overflow: hidden;
+  overscroll-behavior: contain;
+  background: rgba(15, 23, 42, 0.45);
+  backdrop-filter: blur(4px);
+}
+
+@keyframes cp-dialog-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* Popover toast stack */
+[popover].cp-toast-item {
+  position: static;
+  margin: 0;
+  inset: auto;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  overflow: visible;
+}
+
+[popover].cp-toast-item:is(:popover-open, .\:popover-open) {
+  display: block;
+}
+
+/* Validate inputs only after interaction (:user-invalid + JS fallback class) */
+:is(input, textarea, select):is(:user-invalid, .user-invalid-fallback) {
+  border-color: #ef4444;
+  background-color: #fef2f2;
+}
+
+:is(input, textarea, select):user-valid {
+  border-color: #10b981;
+}
+
+/* Defer off-screen feed card layout/paint below initial fold */
+.feed-card-deferred {
+  content-visibility: auto;
+  contain-intrinsic-size: auto none auto 360px;
+}
+
+/* Accessible visually hidden helper */
+.visually-hidden {
+  position: absolute !important;
+  clip-path: inset(50%) !important;
+  overflow: hidden !important;
+  width: 1px !important;
+  height: 1px !important;
+  margin: -1px !important;
+  padding: 0 !important;
+  border: 0 !important;
+  white-space: nowrap !important;
+}
+
+/* Custom Leaflet marker & popup polish */
+.cp-pin-wrapper {
+  background: transparent;
+  border: none;
+}
+
+.cp-pin-pulse {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.cp-pin-pulse::before {
+  content: '';
+  position: absolute;
+  inset: -6px;
+  border-radius: 9999px;
+  background: rgba(244, 63, 94, 0.35);
+  animation: cp-radar 1.8s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+
+@keyframes cp-radar {
+  0% {
+    transform: scale(0.85);
+    opacity: 0.9;
+  }
+  75%,
+  100% {
+    transform: scale(1.9);
+    opacity: 0;
+  }
+}
+
+.leaflet-popup-content-wrapper {
+  border-radius: 16px;
+  padding: 0;
+  overflow: hidden;
+  box-shadow: 0 20px 45px rgba(15, 23, 42, 0.16);
+  border: 1px solid #e2e8f0;
+}
+
+.leaflet-popup-content {
+  margin: 0;
+  width: 270px !important;
+}
+
+.leaflet-container {
+  font-family: 'Plus Jakarta Sans', ui-sans-serif, system-ui, sans-serif;
+  z-index: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  dialog.cp-dialog[open],
+  .cp-pin-pulse::before {
+    animation: none !important;
+  }
+  * {
+    scroll-behavior: auto !important;
+  }
+}

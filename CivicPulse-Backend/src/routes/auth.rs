@@ -76,6 +76,7 @@ pub async fn me(
 ) -> AppResult<Json<CurrentUserResponse>> {
     let session = state.auth.require_authenticated(&headers).await?;
     Ok(Json(CurrentUserResponse {
+        user_id: session.user_id,
         role: session.role,
         name: session.name,
         email: session.email,
@@ -87,8 +88,10 @@ pub async fn me(
 pub async fn change_password(
     State(state): State<AppState>,
     headers: HeaderMap,
+    OptionalConnectIp(peer_ip): OptionalConnectIp,
     Json(payload): Json<ChangePasswordRequest>,
 ) -> AppResult<Json<Value>> {
+    enforce_auth_rate_limit(&state, &headers, peer_ip)?;
     state.auth.change_password(&headers, payload).await?;
     Ok(Json(json!({ "password_updated": true })))
 }
