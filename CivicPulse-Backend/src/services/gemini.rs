@@ -11,7 +11,7 @@ use serde_json::json;
 use crate::{
     error::{AppError, AppResult},
     middleware::metrics::AppMetrics,
-    models::{AiChatResponse, Category, ChatSourceSummary, Post, TravelAdvisory},
+    models::{AiChatResponse, Category, ChatHistoryTurn, ChatSourceSummary, Post, TravelAdvisory},
     services::{
         algorithms::{compute_media_fingerprint, verify_media_magic_bytes, DuplicateSignal},
         geofence::haversine_distance_km,
@@ -86,6 +86,8 @@ struct GeminiContent {
 #[derive(Debug, Deserialize)]
 struct GeminiPart {
     text: Option<String>,
+    #[serde(default)]
+    thought: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,12 +120,13 @@ struct ContextPostItem<'a> {
     created_at: &'a str,
 }
 
-/// Shared pooled client for Gemini 2.5 Flash Multimodal Forensics and Tactical Safety Chat.
+/// Shared pooled client for Gemini Multimodal Forensics and Tactical Safety Chat.
 #[derive(Clone)]
 pub struct GeminiClient {
     http: Client,
     api_key: Option<String>,
     endpoint: String,
+    fallback_endpoints: Vec<String>,
     metrics: Arc<AppMetrics>,
 }
 
@@ -144,12 +147,37 @@ impl GeminiClient {
             http,
             api_key,
             endpoint,
+            fallback_endpoints: Vec::new(),
             metrics,
         })
     }
 
+    pub fn with_fallback_endpoints(mut self, fallback_endpoints: Vec<String>) -> Self {
+        self.fallback_endpoints = fallback_endpoints;
+        self
+    }
+
     pub fn is_configured(&self) -> bool {
         self.api_key.is_some()
+    }
+
+    pub fn primary_model_name(&self) -> Option<String> {
+        if self.is_configured() {
+            extract_model_name(&self.endpoint)
+        } else {
+            None
+        }
+    }
+
+    fn endpoints_chain(&self) -> Vec<&str> {
+        let mut chain = Vec::with_capacity(1 + self.fallback_endpoints.len());
+        chain.push(self.endpoint.as_str());
+        for ep in &self.fallback_endpoints {
+            if !ep.is_empty() && !chain.contains(&ep.as_str()) {
+                chain.push(ep.as_str());
+            }
+        }
+        chain
     }
 
     /// Run Layer 2 Gemini 2.5 Flash multimodal forensics, translation, and safety scoring.
@@ -308,24 +336,50 @@ impl GeminiClient {
             }
         });
 
+        let mut last_reason =
+            "Gemini AI returned a temporary upstream error; queued for community verification.";
+        for ep in self.endpoints_chain() {
+            match self
+                .try_forensics_endpoint(ep, api_key, &payload, input)
+                .await
+            {
+                Ok(result) => return result,
+                Err((is_rate_limit, reason)) => {
+                    if is_rate_limit || last_reason.starts_with("Gemini AI returned a temporary") {
+                        last_reason = reason;
+                    }
+                }
+            }
+        }
+
+        self.metrics
+            .gemini_fallbacks_total
+            .fetch_add(1, Ordering::Relaxed);
+        fallback_forensics(input, last_reason)
+    }
+
+    async fn try_forensics_endpoint(
+        &self,
+        endpoint: &str,
+        api_key: &str,
+        payload: &serde_json::Value,
+        input: &ForensicsInput<'_>,
+    ) -> Result<ForensicsResult, (bool, &'static str)> {
         let response = match self
             .http
-            .post(&self.endpoint)
+            .post(endpoint)
             .header("x-goog-api-key", api_key)
-            .json(&payload)
+            .json(payload)
             .send()
             .await
         {
             Ok(resp) => resp,
             Err(err) => {
-                tracing::warn!(error = %err, "Gemini forensics request failed; activating fallback");
-                self.metrics
-                    .gemini_fallbacks_total
-                    .fetch_add(1, Ordering::Relaxed);
-                return fallback_forensics(
-                    input,
+                tracing::warn!(error = %err, endpoint = %endpoint, "Gemini forensics request failed");
+                return Err((
+                    false,
                     "AI forensic verification temporarily unavailable (network timeout/error); queued for community verification.",
-                );
+                ));
             }
         };
 
@@ -334,68 +388,60 @@ impl GeminiClient {
             let body_snippet = response.text().await.unwrap_or_default();
             tracing::warn!(
                 status = %status,
+                endpoint = %endpoint,
                 body = %truncate_for_log(&body_snippet, 240),
-                "Gemini forensics returned non-2xx status; activating fallback"
+                "Gemini forensics returned non-2xx status"
             );
-            self.metrics
-                .gemini_fallbacks_total
-                .fetch_add(1, Ordering::Relaxed);
-            let reason = if status.as_u16() == 429 {
-                "Gemini AI rate-limited (HTTP 429); gracefully queued for community verification."
-            } else {
-                "Gemini AI returned a temporary upstream error; queued for community verification."
-            };
-            return fallback_forensics(input, reason);
+            if status.as_u16() == 429 {
+                return Err((
+                    true,
+                    "Gemini AI rate-limited (HTTP 429); gracefully queued for community verification.",
+                ));
+            }
+            return Err((
+                false,
+                "Gemini AI returned a temporary upstream error; queued for community verification.",
+            ));
         }
 
         let parsed: GeminiGenerateResponse = match response.json().await {
             Ok(p) => p,
             Err(err) => {
-                tracing::warn!(error = %err, "Failed to parse Gemini HTTP response JSON; activating fallback");
-                self.metrics
-                    .gemini_fallbacks_total
-                    .fetch_add(1, Ordering::Relaxed);
-                return fallback_forensics(
-                    input,
+                tracing::warn!(error = %err, endpoint = %endpoint, "Failed to parse Gemini HTTP response JSON");
+                return Err((
+                    false,
                     "Unable to parse Gemini AI response envelope; queued for community verification.",
-                );
+                ));
             }
         };
 
         let Some(raw_text) = extract_response_text(&parsed) else {
-            tracing::warn!("Gemini forensics returned empty candidate text; activating fallback");
-            self.metrics
-                .gemini_fallbacks_total
-                .fetch_add(1, Ordering::Relaxed);
-            return fallback_forensics(
-                input,
+            tracing::warn!(endpoint = %endpoint, "Gemini forensics returned empty candidate text");
+            return Err((
+                false,
                 "Gemini AI returned empty forensic output; queued for community verification.",
-            );
+            ));
         };
 
-        match parse_forensics_json(&raw_text, input) {
-            Ok(result) => result,
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    raw = %truncate_for_log(&raw_text, 240),
-                    "Gemini forensics inner JSON validation failed; activating fallback"
-                );
-                self.metrics
-                    .gemini_fallbacks_total
-                    .fetch_add(1, Ordering::Relaxed);
-                fallback_forensics(
-                    input,
-                    "Gemini AI returned non-conforming JSON output; queued for community verification.",
-                )
-            }
-        }
+        parse_forensics_json(&raw_text, input).map_err(|err| {
+            tracing::warn!(
+                error = %err,
+                endpoint = %endpoint,
+                raw = %truncate_for_log(&raw_text, 240),
+                "Gemini forensics inner JSON validation failed"
+            );
+            (
+                false,
+                "Gemini AI returned non-conforming JSON output; queued for community verification.",
+            )
+        })
     }
 
     /// Answer real-time community safety and eco-tourism questions using all active non-quarantined posts.
     pub async fn answer_safety_chat(
         &self,
         message: &str,
+        history: &[ChatHistoryTurn],
         posts: &[Post],
         user_coords: Option<(f64, f64)>,
     ) -> AiChatResponse {
@@ -441,6 +487,7 @@ impl GeminiClient {
                 referenced_posts_count,
                 sources,
                 fallback_used: true,
+                model_used: None,
             };
         };
 
@@ -477,7 +524,7 @@ impl GeminiClient {
             None => "User GPS coordinates: not provided.".to_string(),
         };
 
-        let prompt = format!(
+        let grounding_prompt = format!(
             "You are the CivicPulse Live Tactical & Eco-Tourism Safety Advisor.\n\
              Answer the user's question accurately using ONLY the live active verified/pending reports below \
              (quarantined fake posts have already been removed). Respond in the same language as the user \
@@ -487,41 +534,59 @@ impl GeminiClient {
              \n\
              {user_gps_note}\n\
              Active Live Reports JSON ({referenced_posts_count} total):\n\
-             {context_json}\n\
-             \n\
-             User Question: {message}"
+             {context_json}"
         );
 
+        let contents = build_chat_contents(&grounding_prompt, history, message);
         let payload = json!({
-            "contents": [{
-                "role": "user",
-                "parts": [{ "text": prompt }]
-            }],
+            "contents": contents,
             "generationConfig": {
                 "temperature": 0.3
             }
         });
 
+        for ep in self.endpoints_chain() {
+            if let Some(reply) = self.try_chat_endpoint(ep, api_key, &payload).await {
+                return AiChatResponse {
+                    reply,
+                    referenced_posts_count,
+                    sources,
+                    fallback_used: false,
+                    model_used: extract_model_name(ep),
+                };
+            }
+        }
+
+        self.metrics
+            .gemini_fallbacks_total
+            .fetch_add(1, Ordering::Relaxed);
+        AiChatResponse {
+            reply: build_deterministic_chat_fallback(message, &active_posts, user_coords),
+            referenced_posts_count,
+            sources,
+            fallback_used: true,
+            model_used: None,
+        }
+    }
+
+    async fn try_chat_endpoint(
+        &self,
+        endpoint: &str,
+        api_key: &str,
+        payload: &serde_json::Value,
+    ) -> Option<String> {
         let response = match self
             .http
-            .post(&self.endpoint)
+            .post(endpoint)
             .header("x-goog-api-key", api_key)
-            .json(&payload)
+            .json(payload)
             .send()
             .await
         {
             Ok(r) => r,
             Err(err) => {
-                tracing::warn!(error = %err, "Gemini chat request failed; using deterministic live-data summary");
-                self.metrics
-                    .gemini_fallbacks_total
-                    .fetch_add(1, Ordering::Relaxed);
-                return AiChatResponse {
-                    reply: build_deterministic_chat_fallback(message, &active_posts, user_coords),
-                    referenced_posts_count,
-                    sources,
-                    fallback_used: true,
-                };
+                tracing::warn!(error = %err, endpoint = %endpoint, "Gemini chat request failed");
+                return None;
             }
         };
 
@@ -530,55 +595,24 @@ impl GeminiClient {
             let body_snippet = response.text().await.unwrap_or_default();
             tracing::warn!(
                 status = %status,
+                endpoint = %endpoint,
                 body = %truncate_for_log(&body_snippet, 240),
-                "Gemini chat returned non-2xx; using deterministic live-data summary"
+                "Gemini chat returned non-2xx"
             );
-            self.metrics
-                .gemini_fallbacks_total
-                .fetch_add(1, Ordering::Relaxed);
-            return AiChatResponse {
-                reply: build_deterministic_chat_fallback(message, &active_posts, user_coords),
-                referenced_posts_count,
-                sources,
-                fallback_used: true,
-            };
+            return None;
         }
 
         let parsed: GeminiGenerateResponse = match response.json().await {
             Ok(p) => p,
             Err(err) => {
-                tracing::warn!(error = %err, "Failed to parse Gemini chat response; using deterministic fallback");
-                self.metrics
-                    .gemini_fallbacks_total
-                    .fetch_add(1, Ordering::Relaxed);
-                return AiChatResponse {
-                    reply: build_deterministic_chat_fallback(message, &active_posts, user_coords),
-                    referenced_posts_count,
-                    sources,
-                    fallback_used: true,
-                };
+                tracing::warn!(error = %err, endpoint = %endpoint, "Failed to parse Gemini chat response");
+                return None;
             }
         };
 
-        match extract_response_text(&parsed) {
-            Some(reply) if !reply.trim().is_empty() => AiChatResponse {
-                reply: reply.trim().to_string(),
-                referenced_posts_count,
-                sources,
-                fallback_used: false,
-            },
-            _ => {
-                self.metrics
-                    .gemini_fallbacks_total
-                    .fetch_add(1, Ordering::Relaxed);
-                AiChatResponse {
-                    reply: build_deterministic_chat_fallback(message, &active_posts, user_coords),
-                    referenced_posts_count,
-                    sources,
-                    fallback_used: true,
-                }
-            }
-        }
+        extract_response_text(&parsed)
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty())
     }
 }
 
@@ -674,7 +708,7 @@ fn parse_forensics_json(raw_text: &str, input: &ForensicsInput<'_>) -> Result<Fo
         .unwrap_or_else(|_| default_advisory_for_category(input.category));
 
     let reasoning = if parsed.ai_reasoning.trim().is_empty() {
-        "Forensic assessment completed by Gemini 2.5 Flash.".to_string()
+        "Forensic assessment completed by Gemini AI.".to_string()
     } else {
         parsed.ai_reasoning.trim().to_string()
     };
@@ -722,12 +756,78 @@ const fn default_severity_for_category(category: Category) -> u8 {
     }
 }
 
+pub fn extract_model_name(endpoint: &str) -> Option<String> {
+    let (_, after_models) = endpoint.split_once("/models/")?;
+    let model = after_models
+        .split([':', '?'])
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    Some(model.to_string())
+}
+
+fn build_chat_contents(
+    grounding_prompt: &str,
+    history: &[ChatHistoryTurn],
+    message: &str,
+) -> Vec<serde_json::Value> {
+    let cleaned: Vec<(&'static str, String)> = history
+        .iter()
+        .rev()
+        .filter_map(|turn| {
+            let trimmed = turn.text.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let role = match turn.role.trim().to_ascii_lowercase().as_str() {
+                "assistant" | "model" => "model",
+                _ => "user",
+            };
+            let capped: String = trimmed.chars().take(2000).collect();
+            Some((role, capped))
+        })
+        .take(10)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    if cleaned.is_empty() {
+        return vec![json!({
+            "role": "user",
+            "parts": [{ "text": format!("{grounding_prompt}\n\nUser Question: {message}") }]
+        })];
+    }
+
+    let mut contents = Vec::with_capacity(cleaned.len() + 3);
+    contents.push(json!({
+        "role": "user",
+        "parts": [{ "text": grounding_prompt }]
+    }));
+    contents.push(json!({
+        "role": "model",
+        "parts": [{ "text": "Understood. I will answer accurately and concisely using only the live CivicPulse reports above in the user's language." }]
+    }));
+    for (role, text) in cleaned {
+        contents.push(json!({
+            "role": role,
+            "parts": [{ "text": text }]
+        }));
+    }
+    contents.push(json!({
+        "role": "user",
+        "parts": [{ "text": message }]
+    }));
+    contents
+}
+
 fn extract_response_text(resp: &GeminiGenerateResponse) -> Option<String> {
     let candidate = resp.candidates.first()?;
     let content = candidate.content.as_ref()?;
     let joined: String = content
         .parts
         .iter()
+        .filter(|p| !p.thought)
         .filter_map(|p| p.text.as_deref())
         .collect::<Vec<_>>()
         .join("\n");
@@ -874,5 +974,35 @@ mod tests {
         assert_eq!(res.travel_advisory, TravelAdvisory::Danger);
         assert_eq!(res.translated_description, "Mudslide reported");
         assert!(!res.used_fallback);
+    }
+
+    #[test]
+    fn extract_response_text_ignores_thought_parts() {
+        let parsed: GeminiGenerateResponse = serde_json::from_value(json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        { "text": "internal chain of thought", "thought": true },
+                        { "text": "Verified road flood alert in Colombo." }
+                    ]
+                }
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            extract_response_text(&parsed).as_deref(),
+            Some("Verified road flood alert in Colombo.")
+        );
+    }
+
+    #[test]
+    fn extract_model_name_parses_google_endpoints() {
+        assert_eq!(
+            extract_model_name("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent")
+                .as_deref(),
+            Some("gemini-3.5-flash-lite")
+        );
+        assert_eq!(extract_model_name("http://127.0.0.1:8081/generate"), None);
     }
 }

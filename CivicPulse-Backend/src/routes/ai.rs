@@ -38,7 +38,7 @@ pub async fn ai_chat(
     let active_posts = state.repo.list_active_non_quarantined().await?;
     let response = state
         .gemini
-        .answer_safety_chat(&message, &active_posts, user_coords)
+        .answer_safety_chat(&message, &payload.history, &active_posts, user_coords)
         .await;
 
     Ok(Json(response))

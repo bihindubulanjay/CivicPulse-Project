@@ -1,14 +1,33 @@
 # syntax=docker/dockerfile:1
 
-FROM rust:1.85-bookworm AS builder
+FROM rust:1-slim-bookworm AS builder
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        gcc \
+        libc6-dev \
+        pkg-config \
+        libssl-dev \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /usr/src/civicpulse
 
-COPY Cargo.toml ./
-RUN mkdir -p src && echo "fn main() {}" > src/main.rs && cargo build --release || true
-RUN rm -rf src
+# Pre-compile third-party dependencies for layer caching
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src \
+    && touch src/lib.rs \
+    && echo "fn main() {}" > src/main.rs \
+    && cargo build --release --locked \
+    && rm -rf src \
+        target/release/.fingerprint/civicpulse* \
+        target/release/deps/civicpulse* \
+        target/release/deps/libcivicpulse* \
+        target/release/civicpulse-backend*
 
+# Build the real civicpulse-backend binary
 COPY src ./src
-RUN cargo build --release
+RUN touch src/lib.rs src/main.rs \
+    && cargo build --release --locked --bin civicpulse-backend
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
@@ -33,6 +52,7 @@ ENV HOST=0.0.0.0 \
     AUTH_RATE_LIMIT_PER_15MIN=15 \
     STRICT_UNIQUE_VOTERS=true \
     TRUST_PROXY_HEADERS=true \
+    SEED_INITIAL_POSTS=false \
     SESSION_TTL_HOURS=24 \
     AI_RETRY_INTERVAL_SECS=60 \
     STALE_ALERT_HOURS=72 \

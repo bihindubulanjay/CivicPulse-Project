@@ -5,13 +5,15 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
+use chrono::{SecondsFormat, Utc};
 use serde_json::{json, Value};
 
 use crate::{
     error::{AppError, AppResult},
     middleware::rate_limit::{extract_client_ip, OptionalConnectIp},
     services::auth::{
-        AuthResponse, ChangePasswordRequest, CurrentUserResponse, LoginRequest, RegisterRequest,
+        AuthResponse, AuthStatusResponse, ChangePasswordRequest, CurrentUserResponse,
+        LoginRequest, RegisterRequest,
     },
     state::AppState,
 };
@@ -39,7 +41,14 @@ fn enforce_auth_rate_limit(
     Ok(())
 }
 
+/// `GET /api/auth/status` — report whether an Administrator account has already been initialized.
+pub async fn status(State(state): State<AppState>) -> AppResult<Json<AuthStatusResponse>> {
+    let res = state.auth.status().await?;
+    Ok(Json(res))
+}
+
 /// `POST /api/auth/register` — create a new user account with Argon2id password hash.
+/// Automatically promotes the very first account on a fresh database to `admin`.
 pub async fn register(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -69,18 +78,38 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> AppRes
     Ok(Json(json!({ "logged_out": true })))
 }
 
-/// `GET /api/auth/me` — inspect the currently authenticated session.
+/// `POST /api/auth/logout-all` — revoke all other active sessions for this account while preserving current session.
+pub async fn logout_all(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<Value>> {
+    let revoked_sessions = state.auth.logout_all_other_sessions(&headers).await?;
+    Ok(Json(json!({ "revoked_sessions": revoked_sessions })))
+}
+
+/// `GET /api/auth/me` — inspect the currently authenticated session & live SQLite profile metrics.
 pub async fn me(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<CurrentUserResponse>> {
     let session = state.auth.require_authenticated(&headers).await?;
+    let now_iso = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let (active_sessions_count, reports_submitted, votes_cast) = state
+        .repo
+        .get_user_profile_stats(&session.user_id, &now_iso)
+        .await?;
+
     Ok(Json(CurrentUserResponse {
         user_id: session.user_id,
         role: session.role,
         name: session.name,
         email: session.email,
         reputation_score: session.reputation_score,
+        created_at: session.created_at,
+        expires_at: session.expires_at,
+        active_sessions_count,
+        reports_submitted,
+        votes_cast,
     }))
 }
 

@@ -53,6 +53,8 @@ async fn main() {
         db_pool_size = state.config.db_pool_size,
         media_storage_mode = ?state.config.media_storage_mode,
         gemini_configured = state.gemini.is_configured(),
+        gemini_model = ?state.gemini.primary_model_name(),
+        gemini_project = ?state.config.gemini_project,
         geofence_radius_km = state.config.geofence_radius_km,
         rate_limit_post_per_min = state.config.rate_limit_post_per_min,
         trust_proxy_headers = state.config.trust_proxy_headers,

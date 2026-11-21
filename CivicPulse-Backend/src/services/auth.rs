@@ -64,6 +64,7 @@ pub struct AuthSession {
     pub name: String,
     pub email: String,
     pub reputation_score: u32,
+    pub created_at: String,
     pub expires_at: String,
     #[serde(skip_serializing)]
     pub token_hash: String,
@@ -106,6 +107,17 @@ pub struct CurrentUserResponse {
     pub name: String,
     pub email: String,
     pub reputation_score: u32,
+    pub created_at: String,
+    pub expires_at: String,
+    pub active_sessions_count: usize,
+    pub reports_submitted: usize,
+    pub votes_cast: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthStatusResponse {
+    pub has_admin: bool,
+    pub users_count: usize,
 }
 
 /// Persistent Argon2id + SQLite session auth service (survives restarts cleanly).
@@ -123,35 +135,45 @@ impl AuthService {
         }
     }
 
-    /// Seed configured Admin & Reporter accounts if not already in SQLite.
+    /// Seed configured Admin & Reporter accounts ONLY when explicit credentials exist in env/test config.
     pub async fn seed_default_accounts(&self, config: &Config) -> AppResult<()> {
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
 
-        let admin_hash = hash_password_argon2id(&config.admin_seed_password)?;
-        self.repo
-            .seed_user_if_missing(StoredUser {
-                id: Uuid::new_v4().to_string(),
-                name: config.admin_seed_name.clone(),
-                email: config.admin_seed_email.trim().to_ascii_lowercase(),
-                role: UserRole::Admin,
-                password_hash: admin_hash,
-                reputation_score: 100,
-                created_at: now.clone(),
-            })
-            .await?;
+        if let (Some(email), Some(password)) = (
+            config.admin_seed_email.as_deref(),
+            config.admin_seed_password.as_deref(),
+        ) {
+            let admin_hash = hash_password_argon2id(password)?;
+            self.repo
+                .seed_user_if_missing(StoredUser {
+                    id: Uuid::new_v4().to_string(),
+                    name: config.admin_seed_name.clone(),
+                    email: email.trim().to_ascii_lowercase(),
+                    role: UserRole::Admin,
+                    password_hash: admin_hash,
+                    reputation_score: 100,
+                    created_at: now.clone(),
+                })
+                .await?;
+        }
 
-        let user_hash = hash_password_argon2id(&config.user_seed_password)?;
-        self.repo
-            .seed_user_if_missing(StoredUser {
-                id: Uuid::new_v4().to_string(),
-                name: config.user_seed_name.clone(),
-                email: config.user_seed_email.trim().to_ascii_lowercase(),
-                role: UserRole::User,
-                password_hash: user_hash,
-                reputation_score: 25,
-                created_at: now,
-            })
-            .await?;
+        if let (Some(email), Some(password)) = (
+            config.user_seed_email.as_deref(),
+            config.user_seed_password.as_deref(),
+        ) {
+            let user_hash = hash_password_argon2id(password)?;
+            self.repo
+                .seed_user_if_missing(StoredUser {
+                    id: Uuid::new_v4().to_string(),
+                    name: config.user_seed_name.clone(),
+                    email: email.trim().to_ascii_lowercase(),
+                    role: UserRole::User,
+                    password_hash: user_hash,
+                    reputation_score: 25,
+                    created_at: now,
+                })
+                .await?;
+        }
 
         Ok(())
     }
@@ -220,9 +242,24 @@ impl AuthService {
         }
     }
 
+    pub async fn status(&self) -> AppResult<AuthStatusResponse> {
+        let (has_admin, users_count) = self.repo.get_auth_status().await?;
+        Ok(AuthStatusResponse {
+            has_admin,
+            users_count,
+        })
+    }
+
     pub async fn logout(&self, headers: &HeaderMap) -> AppResult<()> {
         let session = self.require_authenticated(headers).await?;
         self.repo.delete_session(&session.token_hash).await
+    }
+
+    pub async fn logout_all_other_sessions(&self, headers: &HeaderMap) -> AppResult<usize> {
+        let session = self.require_authenticated(headers).await?;
+        self.repo
+            .revoke_other_sessions(&session.user_id, &session.token_hash)
+            .await
     }
 
     pub async fn change_password(
@@ -321,6 +358,7 @@ impl AuthService {
             name: user.name,
             email: user.email,
             reputation_score: user.reputation_score,
+            created_at: user.created_at,
             expires_at,
             token_hash,
         }))

@@ -1,0 +1,117 @@
+name: Deploy CivicPulse to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Configure GitHub Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Build frontends for GitHub Pages
+        env:
+          GH_PAGES_BASE_PATH: ${{ steps.pages.outputs.base_path }}
+          PAGES_BASE_PATH: ${{ vars.PAGES_BASE_PATH }}
+          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+        run: |
+          set -euo pipefail
+
+          if [ -d "CivicPulse-Console" ] && [ -f "CivicPulse-Console/package.json" ]; then
+            CONSOLE_DIR="CivicPulse-Console"
+          elif [ -d "CivicPulse-Frontend" ] && [ -f "CivicPulse-Frontend/package.json" ]; then
+            CONSOLE_DIR="CivicPulse-Frontend"
+          else
+            echo "::error::Neither CivicPulse-Console nor CivicPulse-Frontend directory found."
+            exit 1
+          fi
+
+          RAW_PREFIX="${PAGES_BASE_PATH:-${GH_PAGES_BASE_PATH:-}}"
+          BASE_PREFIX="${RAW_PREFIX%/}"
+
+          rm -rf ./_site
+          mkdir -p ./_site
+
+          install_deps() {
+            if [ -f package-lock.json ]; then
+              npm ci
+            else
+              npm install
+            fi
+          }
+
+          if [ -d "CivicPulse-Website" ] && [ -f "CivicPulse-Website/package.json" ]; then
+            CONSOLE_URL="${BASE_PREFIX}/console/"
+            echo "Building CivicPulse-Website with basePrefix='${BASE_PREFIX}' and consoleUrl='${CONSOLE_URL}'"
+            (
+              cd CivicPulse-Website
+              install_deps
+              GITHUB_PAGES=true \
+              NEXT_PUBLIC_BASE_PATH="${BASE_PREFIX}" \
+              NEXT_PUBLIC_CONSOLE_URL="${CONSOLE_URL}" \
+              npm run build
+            )
+            cp -a CivicPulse-Website/out/. ./_site/
+
+            echo "Building ${CONSOLE_DIR} into _site/console/ with VITE_BASE_PATH='${CONSOLE_URL}'"
+            (
+              cd "${CONSOLE_DIR}"
+              install_deps
+              VITE_BASE_PATH="${CONSOLE_URL}" \
+              VITE_API_BASE_URL="${VITE_API_BASE_URL:-}" \
+              npm run build
+            )
+            mkdir -p ./_site/console
+            cp -a "${CONSOLE_DIR}/dist/." ./_site/console/
+          else
+            ROOT_BASE="${BASE_PREFIX}/"
+            echo "CivicPulse-Website not present; building ${CONSOLE_DIR} at root with VITE_BASE_PATH='${ROOT_BASE}'"
+            (
+              cd "${CONSOLE_DIR}"
+              install_deps
+              VITE_BASE_PATH="${ROOT_BASE}" \
+              VITE_API_BASE_URL="${VITE_API_BASE_URL:-}" \
+              npm run build
+            )
+            cp -a "${CONSOLE_DIR}/dist/." ./_site/
+          fi
+
+          touch ./_site/.nojekyll
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./_site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

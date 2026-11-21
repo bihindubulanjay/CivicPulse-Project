@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { List, Map as MapIcon } from 'lucide-react';
+import { AccountModal } from './components/AccountModal';
 import { AdminConsole } from './components/AdminConsole';
 import { AiAdvisorDrawer } from './components/AiAdvisorDrawer';
 import { AuthModal } from './components/AuthModal';
@@ -15,15 +16,17 @@ import {
   loadStoredSession,
   saveStoredSession,
 } from './lib/api';
-import { QUICK_JUMP_LOCATIONS } from './lib/geo';
+import { formatAccuracyMeters, haversineKm } from './lib/geo';
 import { loadOfflineQueue, syncOfflineQueue } from './lib/offlineQueue';
 import type {
   AuthSession,
   Category,
+  CurrentUser,
+  GpsStatus,
   LayoutMode,
   MobileTab,
   Post,
-  QuickLocation,
+  ReverseGeocodeResponse,
   SortMode,
   UserCoords,
 } from './types/civicpulse';
@@ -35,6 +38,7 @@ function CivicPulseWorkspace() {
   const [session, setSession] = useState<AuthSession | null>(() => loadStoredSession());
   const [allowGuestUploads, setAllowGuestUploads] = useState<boolean>(true);
   const [authModalOpen, setAuthModalOpen] = useState(false);
+  const [accountModalOpen, setAccountModalOpen] = useState(false);
   const [reportModalOpen, setReportModalOpen] = useState(false);
 
   // Feed, Filters & Map State
@@ -53,17 +57,26 @@ function CivicPulseWorkspace() {
   const [adminViewActive, setAdminViewActive] = useState(false);
   const [adminRefreshNonce, setAdminRefreshNonce] = useState(0);
 
-  // GPS & Map Target
+  // Live GPS & Google-Maps-Style Address State
   const [userCoords, setUserCoords] = useState<UserCoords | null>(null);
-  const [gpsLoading, setGpsLoading] = useState(false);
-  const [selectedQuickJumpId, setSelectedQuickJumpId] = useState('sri-lanka');
+  const [gpsStatus, setGpsStatus] = useState<GpsStatus>('idle');
+  const [gpsTracking, setGpsTracking] = useState(false);
+  const [liveLocationDetails, setLiveLocationDetails] = useState<ReverseGeocodeResponse | null>(
+    null,
+  );
   const [flyTarget, setFlyTarget] = useState<MapFlyTarget | null>(null);
   const [highlightedPostId, setHighlightedPostId] = useState<string | null>(null);
-  const [reportInitialPin, setReportInitialPin] = useState<{ lat: number; lng: number } | null>(null);
+  const [reportInitialPin, setReportInitialPin] = useState<{ lat: number; lng: number } | null>(
+    null,
+  );
+  const [reportInitialAddress, setReportInitialAddress] =
+    useState<ReverseGeocodeResponse | null>(null);
 
   // Connectivity & Offline Queue
   const [backendOnline, setBackendOnline] = useState(true);
   const [sseConnected, setSseConnected] = useState(false);
+  const [geminiConfigured, setGeminiConfigured] = useState(false);
+  const [geminiModel, setGeminiModel] = useState<string | null>(null);
   const [offlineQueueCount, setOfflineQueueCount] = useState(() => loadOfflineQueue().length);
   const [isSyncingOffline, setIsSyncingOffline] = useState(false);
 
@@ -71,6 +84,9 @@ function CivicPulseWorkspace() {
   const highlightTimerRef = useRef<number | null>(null);
   const fetchSeqRef = useRef(0);
   const isSyncingOfflineRef = useRef(false);
+  const lastGeocodedGpsRef = useRef<{ lat: number; lng: number } | null>(null);
+  const liveReverseAbortRef = useRef<AbortController | null>(null);
+  const watchIdRef = useRef<number | null>(null);
 
   const registerPostRef = useCallback((id: string, node: HTMLElement | null) => {
     if (node) {
@@ -86,33 +102,82 @@ function CivicPulseWorkspace() {
     return () => window.clearTimeout(timer);
   }, [search]);
 
-  // Validate restored auth session against live backend
+  // Reverse-geocode live GPS coords only when moving > 50m (avoids redundant requests)
+  const resolveLiveLocationDetails = useCallback((coords: UserCoords) => {
+    const prev = lastGeocodedGpsRef.current;
+    if (prev && haversineKm(prev.lat, prev.lng, coords.lat, coords.lng) < 0.05) {
+      return;
+    }
+    lastGeocodedGpsRef.current = { lat: coords.lat, lng: coords.lng };
+    liveReverseAbortRef.current?.abort();
+    const controller = new AbortController();
+    liveReverseAbortRef.current = controller;
+
+    apiClient
+      .geocodeReverse(coords.lat, coords.lng, controller.signal)
+      .then((res) => {
+        if (!controller.signal.aborted) {
+          setLiveLocationDetails(res);
+        }
+      })
+      .catch(() => {
+        // Non-fatal if Nominatim or backend is unreachable
+      });
+  }, []);
+
+  // Apply fresh GPS coordinates consistently across map & address state
+  const applyLiveCoords = useCallback(
+    (coords: UserCoords, opts?: { centerMap?: boolean; sortNearest?: boolean }) => {
+      setUserCoords(coords);
+      setGpsStatus('live');
+      resolveLiveLocationDetails(coords);
+
+      if (opts?.sortNearest) {
+        setSortMode('nearest');
+      }
+      if (opts?.centerMap) {
+        const coarse = coords.accuracy !== undefined && coords.accuracy > 500;
+        setFlyTarget({
+          lat: coords.lat,
+          lng: coords.lng,
+          zoom: coarse ? 13 : 15,
+          nonce: Date.now(),
+        });
+      }
+    },
+    [resolveLiveLocationDetails],
+  );
+
+  // Sync restored auth session against live SQLite session/user row
+  const handleProfileSynced = useCallback((user: CurrentUser) => {
+    setSession((prev) => {
+      if (!prev) return null;
+      const next: AuthSession = {
+        ...prev,
+        user_id: user.user_id,
+        role: user.role,
+        name: user.name,
+        email: user.email,
+        reputation_score: user.reputation_score,
+        expires_at: user.expires_at,
+      };
+      saveStoredSession(next);
+      return next;
+    });
+  }, []);
+
   useEffect(() => {
     if (!session?.token) return;
     apiClient
       .me(session.token)
-      .then((user) => {
-        setSession((prev) => {
-          if (!prev) return null;
-          const next: AuthSession = {
-            ...prev,
-            user_id: user.user_id ?? prev.user_id,
-            role: user.role,
-            name: user.name,
-            email: user.email,
-            reputation_score: user.reputation_score,
-          };
-          saveStoredSession(next);
-          return next;
-        });
-      })
+      .then(handleProfileSynced)
       .catch((err) => {
         if (err instanceof ApiError && err.status === 401) {
           saveStoredSession(null);
           setSession(null);
         }
       });
-  }, [session?.token]);
+  }, [session?.token, handleProfileSynced]);
 
   // Load posts from live backend
   const fetchPosts = useCallback(async () => {
@@ -159,17 +224,98 @@ function CivicPulseWorkspace() {
     fetchPosts();
   }, [fetchPosts]);
 
-  // Sync live guest upload policy on mount & role changes
+  // Auto-fetch initial live GPS once on startup
+  useEffect(() => {
+    if (!navigator.geolocation) {
+      setGpsStatus('unavailable');
+      return;
+    }
+    setGpsStatus('locating');
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const accuracy = Number.isFinite(pos.coords.accuracy) ? pos.coords.accuracy : undefined;
+        applyLiveCoords(
+          { lat: pos.coords.latitude, lng: pos.coords.longitude, accuracy },
+          { centerMap: true },
+        );
+      },
+      (err) => {
+        setGpsStatus(err.code === err.PERMISSION_DENIED ? 'denied' : 'unavailable');
+      },
+      { enableHighAccuracy: true, timeout: 12_000, maximumAge: 0 },
+    );
+    return () => {
+      liveReverseAbortRef.current?.abort();
+    };
+  }, [applyLiveCoords]);
+
+  // Continuous live GPS watch when toggled ON
+  useEffect(() => {
+    if (!gpsTracking) {
+      if (watchIdRef.current !== null && navigator.geolocation) {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+        watchIdRef.current = null;
+      }
+      return;
+    }
+
+    if (!navigator.geolocation) {
+      setGpsTracking(false);
+      setGpsStatus('unavailable');
+      return;
+    }
+
+    const id = navigator.geolocation.watchPosition(
+      (pos) => {
+        const accuracy = Number.isFinite(pos.coords.accuracy) ? pos.coords.accuracy : undefined;
+        applyLiveCoords({ lat: pos.coords.latitude, lng: pos.coords.longitude, accuracy });
+      },
+      (err) => {
+        setGpsStatus(err.code === err.PERMISSION_DENIED ? 'denied' : 'unavailable');
+        setGpsTracking(false);
+        pushToast({
+          tone: 'warning',
+          title: 'Live GPS tracking paused',
+          description: err.message,
+        });
+      },
+      { enableHighAccuracy: true, maximumAge: 5_000, timeout: 15_000 },
+    );
+    watchIdRef.current = id;
+
+    return () => {
+      navigator.geolocation.clearWatch(id);
+      watchIdRef.current = null;
+    };
+  }, [gpsTracking, applyLiveCoords, pushToast]);
+
+  // Sync live guest upload policy & AI health status on mount & role changes
   useEffect(() => {
     apiClient
-      .fetchGuestUploadPolicy(session)
-      .then((allowed) => {
-        setAllowGuestUploads(allowed);
+      .getHealth()
+      .then((health) => {
+        setGeminiConfigured(Boolean(health.gemini_configured));
+        setGeminiModel(health.gemini_model ?? null);
+        if (session?.role !== 'admin') {
+          setAllowGuestUploads(health.allow_guest_uploads);
+        }
         setBackendOnline(true);
       })
       .catch(() => {
         // Keep optimistic current value when offline
       });
+
+    if (session?.role === 'admin') {
+      apiClient
+        .getAdminSettings(session.token)
+        .then((settings) => {
+          setAllowGuestUploads(settings.allow_guest_uploads);
+          setBackendOnline(true);
+        })
+        .catch(() => {
+          // Keep optimistic current value when offline
+        });
+    }
   }, [session]);
 
   // Offline Queue Sync Handler
@@ -269,6 +415,7 @@ function CivicPulseWorkspace() {
       'comment_added',
       'post_approved',
       'post_rejected',
+      'post_deleted',
       'post_ai_updated',
       'admin_queue_updated',
     ];
@@ -284,13 +431,14 @@ function CivicPulseWorkspace() {
     };
   }, [fetchPosts, session?.role]);
 
-  // GPS Request
+  // Explicit Live GPS Request (button / map FAB)
   function handleRequestGps() {
     if (!navigator.geolocation) {
+      setGpsStatus('unavailable');
       pushToast({ tone: 'error', title: 'Geolocation is unsupported in this browser' });
       return;
     }
-    setGpsLoading(true);
+    setGpsStatus('locating');
     navigator.geolocation.getCurrentPosition(
       (pos) => {
         const accuracy = Number.isFinite(pos.coords.accuracy) ? pos.coords.accuracy : undefined;
@@ -300,32 +448,24 @@ function CivicPulseWorkspace() {
           accuracy,
         };
         const coarse = accuracy !== undefined && accuracy > 500;
-        const accLabel =
-          accuracy !== undefined
-            ? accuracy >= 1000
-              ? `±${(accuracy / 1000).toFixed(1)} km`
-              : `±${Math.round(accuracy)} m`
-            : null;
-        setUserCoords(coords);
-        setSortMode('nearest');
-        setFlyTarget({ lat: coords.lat, lng: coords.lng, zoom: coarse ? 12 : 14, nonce: Date.now() });
-        setGpsLoading(false);
+        const accLabel = accuracy !== undefined ? formatAccuracyMeters(accuracy) : null;
+        applyLiveCoords(coords, { centerMap: true, sortNearest: true });
         pushToast({
           tone: coarse ? 'warning' : 'success',
           title: coarse
-            ? `Approximate GPS detected (${accLabel})`
-            : 'GPS locked & sorting nearest hazards',
+            ? `Approximate live location detected (${accLabel})`
+            : 'Live GPS locked & sorting nearest alerts',
           description: coarse
-            ? 'Desktop IP/Wi-Fi location may be broad — pin exact spots manually on the map.'
+            ? 'Desktop Wi-Fi/IP location may be broad — pin exact spots on the map when reporting.'
             : `${coords.lat.toFixed(5)}, ${coords.lng.toFixed(5)}${accLabel ? ` (${accLabel})` : ''}`,
         });
       },
       (err) => {
-        setGpsLoading(false);
+        setGpsStatus(err.code === err.PERMISSION_DENIED ? 'denied' : 'unavailable');
         pushToast({
           tone: 'warning',
-          title: 'GPS access unavailable',
-          description: `${err.message}. Use the Quick Jump selector or click "Pin Incident on Map".`,
+          title: 'Live location unavailable',
+          description: `${err.message}. Search an address on the map instead.`,
         });
       },
       { enableHighAccuracy: true, timeout: 12_000, maximumAge: 0 },
@@ -333,15 +473,14 @@ function CivicPulseWorkspace() {
   }
 
   function handleClearGps() {
+    setGpsTracking(false);
     setUserCoords(null);
+    setLiveLocationDetails(null);
+    lastGeocodedGpsRef.current = null;
+    setGpsStatus('idle');
     if (sortMode === 'nearest') {
       setSortMode('newest');
     }
-  }
-
-  function handleQuickJump(loc: QuickLocation) {
-    setSelectedQuickJumpId(loc.id);
-    setFlyTarget({ lat: loc.lat, lng: loc.lng, zoom: loc.zoom, nonce: Date.now() });
   }
 
   const jumpToPost = useCallback((postId: string) => {
@@ -401,13 +540,17 @@ function CivicPulseWorkspace() {
     }
     saveStoredSession(null);
     setSession(null);
+    setAccountModalOpen(false);
     setAdminViewActive(false);
     setMobileTab('feed');
     pushToast({ tone: 'info', title: 'Signed out cleanly' });
   }
 
-  const activeDefaultCenter =
-    QUICK_JUMP_LOCATIONS.find((l) => l.id === selectedQuickJumpId) ?? QUICK_JUMP_LOCATIONS[0];
+  const liveLocationLabel =
+    liveLocationDetails?.address?.city ??
+    liveLocationDetails?.address?.suburb ??
+    liveLocationDetails?.short_name ??
+    null;
 
   return (
     <div className="min-h-screen bg-[radial-gradient(ellipse_at_top_right,_var(--tw-gradient-stops))] from-sky-50 via-slate-50 to-emerald-50/40">
@@ -426,11 +569,12 @@ function CivicPulseWorkspace() {
           setLayoutMode(m);
         }}
         userCoords={userCoords}
-        gpsLoading={gpsLoading}
+        gpsStatus={gpsStatus}
+        gpsTracking={gpsTracking}
+        liveLocationLabel={liveLocationLabel}
         onRequestGps={handleRequestGps}
+        onToggleGpsTracking={() => setGpsTracking((prev) => !prev)}
         onClearGps={handleClearGps}
-        selectedQuickJumpId={selectedQuickJumpId}
-        onQuickJump={handleQuickJump}
         offlineQueueCount={offlineQueueCount}
         isSyncingOffline={isSyncingOffline}
         onSyncOffline={handleSyncOfflineQueue}
@@ -440,8 +584,13 @@ function CivicPulseWorkspace() {
         adminViewActive={adminViewActive}
         onToggleAdminView={() => setAdminViewActive((prev) => !prev)}
         onOpenAuth={() => setAuthModalOpen(true)}
+        onOpenAccount={() => setAccountModalOpen(true)}
         onLogout={handleLogout}
-        onOpenReport={() => setReportModalOpen(true)}
+        onOpenReport={() => {
+          setReportInitialPin(null);
+          setReportInitialAddress(null);
+          setReportModalOpen(true);
+        }}
       />
 
       {/* Mobile Tab Switcher */}
@@ -500,12 +649,18 @@ function CivicPulseWorkspace() {
               <LiveMap
                 posts={posts}
                 userCoords={userCoords}
+                gpsStatus={gpsStatus}
+                gpsTracking={gpsTracking}
+                liveLocationDetails={liveLocationDetails}
                 selectedPostId={highlightedPostId}
                 flyTarget={flyTarget}
                 layoutTrigger={`${layoutMode}-${mobileTab}`}
+                onRequestGps={handleRequestGps}
+                onToggleGpsTracking={() => setGpsTracking((prev) => !prev)}
                 onJumpToPost={jumpToPost}
-                onPickLocationToReport={(lat, lng) => {
+                onPickLocationToReport={(lat, lng, details) => {
                   setReportInitialPin({ lat, lng });
+                  setReportInitialAddress(details ?? null);
                   setReportModalOpen(true);
                 }}
               />
@@ -551,18 +706,29 @@ function CivicPulseWorkspace() {
         onSuccess={handleAuthSuccess}
       />
 
+      <AccountModal
+        open={accountModalOpen}
+        session={session}
+        onClose={() => setAccountModalOpen(false)}
+        onProfileSynced={handleProfileSynced}
+        onLogout={handleLogout}
+      />
+
       <ReportIncidentModal
         open={reportModalOpen}
         session={session}
         allowGuestUploads={allowGuestUploads}
         userCoords={userCoords}
-        defaultLat={activeDefaultCenter.lat}
-        defaultLng={activeDefaultCenter.lng}
+        liveLocationDetails={liveLocationDetails}
+        defaultLat={userCoords?.lat ?? 7.8731}
+        defaultLng={userCoords?.lng ?? 80.7718}
         initialPin={reportInitialPin}
-        onGpsDetected={(coords) => setUserCoords(coords)}
+        initialAddressDetails={reportInitialAddress}
+        onGpsDetected={(coords) => applyLiveCoords(coords)}
         onClose={() => {
           setReportModalOpen(false);
           setReportInitialPin(null);
+          setReportInitialAddress(null);
         }}
         onOpenAuth={() => setAuthModalOpen(true)}
         onPostCreated={handlePostCreated}
@@ -570,7 +736,13 @@ function CivicPulseWorkspace() {
         onGuestPolicySynced={setAllowGuestUploads}
       />
 
-      <AiAdvisorDrawer userCoords={userCoords} onJumpToPost={jumpToPost} />
+      <AiAdvisorDrawer
+        userCoords={userCoords}
+        liveLocationDetails={liveLocationDetails}
+        geminiConfigured={geminiConfigured}
+        geminiModel={geminiModel}
+        onJumpToPost={jumpToPost}
+      />
     </div>
   );
 }

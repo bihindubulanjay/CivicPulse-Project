@@ -302,6 +302,13 @@ pub struct AddCommentRequest {
     pub text: String,
 }
 
+/// Prior conversation turn sent from the frontend for multi-turn live AI chat.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatHistoryTurn {
+    pub role: String,
+    pub text: String,
+}
+
 /// Request payload for `POST /api/ai/chat`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AiChatRequest {
@@ -309,6 +316,8 @@ pub struct AiChatRequest {
     pub message: String,
     pub user_lat: Option<f64>,
     pub user_lng: Option<f64>,
+    #[serde(default)]
+    pub history: Vec<ChatHistoryTurn>,
 }
 
 /// Compact summary of a live report referenced by the AI tactical chat.
@@ -331,6 +340,8 @@ pub struct AiChatResponse {
     pub referenced_posts_count: usize,
     pub sources: Vec<ChatSourceSummary>,
     pub fallback_used: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_used: Option<String>,
 }
 
 /// Query parameters for `GET /api/export/geojson`.
@@ -395,6 +406,8 @@ pub struct HealthResponse {
     pub version: Cow<'static, str>,
     pub posts_count: usize,
     pub gemini_configured: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gemini_model: Option<String>,
     pub geofence_radius_km: f64,
     pub rate_limit_post_per_min: usize,
     pub allow_guest_uploads: bool,
@@ -431,4 +444,35 @@ pub struct RealtimeEvent {
     pub severity: u8,
     pub is_resolved: bool,
     pub timestamp: String,
+}
+
+/// Publicly sanitized user summary exposed on `GET /api/admin/users` (never exposes `password_hash`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminUserSummary {
+    pub id: String,
+    pub name: String,
+    pub email: String,
+    pub role: String,
+    pub reputation_score: u32,
+    pub created_at: String,
+    pub posts_count: usize,
+    pub active_sessions_count: usize,
+}
+
+/// Live SQLite table and schema metrics returned by `GET /api/admin/overview`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbOverviewCounts {
+    pub schema_version: i64,
+    pub total_users: usize,
+    pub admins_count: usize,
+    pub active_sessions_count: usize,
+    pub total_posts: usize,
+    pub verified_posts: usize,
+    pub pending_admin_posts: usize,
+    pub quarantined_posts: usize,
+    pub disputed_posts: usize,
+    pub resolved_posts: usize,
+    pub total_comments: usize,
+    pub total_votes: usize,
+    pub total_audit_logs: usize,
 }

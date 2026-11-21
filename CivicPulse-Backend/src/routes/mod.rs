@@ -15,7 +15,7 @@ use axum::{
     extract::{DefaultBodyLimit, State},
     http::HeaderValue,
     middleware,
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use tower_http::{
@@ -48,17 +48,23 @@ pub fn create_router(state: AppState) -> Router {
         .route("/uploads/{filename}", get(uploads::serve_upload))
         .route("/api/events", get(events::sse_events))
         // Role-Based Auth
+        .route("/api/auth/status", get(auth::status))
         .route("/api/auth/register", post(auth::register))
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
+        .route("/api/auth/logout-all", post(auth::logout_all))
         .route("/api/auth/me", get(auth::me))
         .route("/api/auth/change-password", post(auth::change_password))
-        // Admin Settings & Moderation (Admin role required)
+        // Admin Settings, Users, DB Overview & Moderation (Admin role required)
+        .route("/api/admin/overview", get(admin::get_overview))
+        .route("/api/admin/users", get(admin::list_users))
+        .route("/api/admin/users/{id}/role", post(admin::update_user_role))
         .route(
             "/api/admin/settings",
             get(admin::get_settings).post(admin::update_settings),
         )
         .route("/api/admin/pending", get(admin::list_pending))
+        .route("/api/admin/posts/{id}", delete(admin::delete_post))
         .route("/api/admin/posts/{id}/approve", post(admin::approve_post))
         .route("/api/admin/posts/{id}/reject", post(admin::reject_post))
         // Public & Authenticated Posts
@@ -127,6 +133,7 @@ async fn health_check(State(state): State<AppState>) -> AppResult<Json<HealthRes
         version: Cow::Borrowed(env!("CARGO_PKG_VERSION")),
         posts_count,
         gemini_configured: state.gemini.is_configured(),
+        gemini_model: state.gemini.primary_model_name(),
         geofence_radius_km: state.config.geofence_radius_km,
         rate_limit_post_per_min: state.config.rate_limit_post_per_min,
         allow_guest_uploads: state.guest_uploads_allowed(),

@@ -1,8 +1,14 @@
 use std::env;
 
-/// Default Gemini 2.5 Flash REST endpoint.
+/// Default Gemini Flash REST endpoint.
 pub const DEFAULT_GEMINI_ENDPOINT: &str =
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent";
+
+/// Ordered fallback endpoints tried automatically when the primary Gemini model is rate-limited/unavailable.
+pub const DEFAULT_GEMINI_FALLBACK_ENDPOINTS: &[&str] = &[
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent",
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaStorageMode {
@@ -31,14 +37,16 @@ pub struct Config {
     pub session_ttl_hours: i64,
     pub allow_guest_uploads_default: bool,
     pub seed_initial_posts: bool,
-    pub admin_seed_email: String,
-    pub admin_seed_password: String,
+    pub admin_seed_email: Option<String>,
+    pub admin_seed_password: Option<String>,
     pub admin_seed_name: String,
-    pub user_seed_email: String,
-    pub user_seed_password: String,
+    pub user_seed_email: Option<String>,
+    pub user_seed_password: Option<String>,
     pub user_seed_name: String,
     pub gemini_api_key: Option<String>,
+    pub gemini_project: Option<String>,
     pub gemini_endpoint: String,
+    pub gemini_fallback_endpoints: Vec<String>,
     pub gemini_timeout_secs: u64,
     pub ai_retry_interval_secs: u64,
     pub stale_alert_hours: i64,
@@ -105,28 +113,41 @@ impl Config {
         let strict_unique_voters = parse_bool("STRICT_UNIQUE_VOTERS", true);
         let session_ttl_hours = parse_i64("SESSION_TTL_HOURS", 24).clamp(1, 8760);
         let allow_guest_uploads_default = parse_bool("ALLOW_GUEST_UPLOADS_DEFAULT", true);
-        let seed_initial_posts = parse_bool("SEED_INITIAL_POSTS", true);
+        let seed_initial_posts = parse_bool("SEED_INITIAL_POSTS", false);
 
-        let admin_seed_email =
-            non_empty_env("ADMIN_SEED_EMAIL").unwrap_or_else(|| "admin@civicpulse.org".to_string());
+        let admin_seed_email = non_empty_env("ADMIN_SEED_EMAIL").filter(|v| !is_placeholder_seed(v));
         let admin_seed_password =
-            non_empty_env("ADMIN_SEED_PASSWORD").unwrap_or_else(|| "admin123".to_string());
+            non_empty_env("ADMIN_SEED_PASSWORD").filter(|v| !is_placeholder_seed(v));
         let admin_seed_name =
             non_empty_env("ADMIN_SEED_NAME").unwrap_or_else(|| "CivicPulse Admin".to_string());
 
-        let user_seed_email =
-            non_empty_env("USER_SEED_EMAIL").unwrap_or_else(|| "user@civicpulse.org".to_string());
+        let user_seed_email = non_empty_env("USER_SEED_EMAIL").filter(|v| !is_placeholder_seed(v));
         let user_seed_password =
-            non_empty_env("USER_SEED_PASSWORD").unwrap_or_else(|| "user123".to_string());
+            non_empty_env("USER_SEED_PASSWORD").filter(|v| !is_placeholder_seed(v));
         let user_seed_name =
             non_empty_env("USER_SEED_NAME").unwrap_or_else(|| "CivicPulse Reporter".to_string());
 
-        let gemini_api_key = non_empty_env("GEMINI_API_KEY").filter(|k| {
-            !k.eq_ignore_ascii_case("your_gemini_api_key_here")
-                && !k.eq_ignore_ascii_case("changeme")
-        });
+        let gemini_api_key = non_empty_env("GEMINI_API_KEY").filter(|k| !is_placeholder_seed(k));
+        let gemini_project = non_empty_env("GEMINI_PROJECT").filter(|v| !is_placeholder_seed(v));
         let gemini_endpoint =
             non_empty_env("GEMINI_ENDPOINT").unwrap_or_else(|| DEFAULT_GEMINI_ENDPOINT.to_string());
+        let gemini_fallback_endpoints = match non_empty_env("GEMINI_FALLBACK_ENDPOINTS") {
+            Some(raw) => raw
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != gemini_endpoint)
+                .map(ToOwned::to_owned)
+                .collect(),
+            None if gemini_endpoint.contains("generativelanguage.googleapis.com") => {
+                DEFAULT_GEMINI_FALLBACK_ENDPOINTS
+                    .iter()
+                    .copied()
+                    .filter(|ep| *ep != gemini_endpoint)
+                    .map(ToOwned::to_owned)
+                    .collect()
+            }
+            None => Vec::new(),
+        };
         let gemini_timeout_secs = parse_u64("GEMINI_TIMEOUT_SECS", 20).clamp(2, 120);
         let ai_retry_interval_secs = parse_u64("AI_RETRY_INTERVAL_SECS", 60).clamp(5, 3600);
         let stale_alert_hours = parse_i64("STALE_ALERT_HOURS", 72).clamp(1, 8760);
@@ -160,7 +181,9 @@ impl Config {
             user_seed_password,
             user_seed_name,
             gemini_api_key,
+            gemini_project,
             gemini_endpoint,
+            gemini_fallback_endpoints,
             gemini_timeout_secs,
             ai_retry_interval_secs,
             stale_alert_hours,
@@ -193,14 +216,16 @@ impl Config {
             session_ttl_hours: 24,
             allow_guest_uploads_default: true,
             seed_initial_posts: true,
-            admin_seed_email: "admin@civicpulse.org".to_string(),
-            admin_seed_password: "admin123".to_string(),
+            admin_seed_email: Some("admin@civicpulse.org".to_string()),
+            admin_seed_password: Some("admin123".to_string()),
             admin_seed_name: "CivicPulse Admin".to_string(),
-            user_seed_email: "user@civicpulse.org".to_string(),
-            user_seed_password: "user123".to_string(),
+            user_seed_email: Some("user@civicpulse.org".to_string()),
+            user_seed_password: Some("user123".to_string()),
             user_seed_name: "CivicPulse Reporter".to_string(),
             gemini_api_key,
+            gemini_project: None,
             gemini_endpoint,
+            gemini_fallback_endpoints: Vec::new(),
             gemini_timeout_secs: 5,
             ai_retry_interval_secs: 60,
             stale_alert_hours: 72,
@@ -212,6 +237,14 @@ impl Config {
     pub fn bind_addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
+}
+
+fn is_placeholder_seed(val: &str) -> bool {
+    let lower = val.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "your_gemini_api_key_here" | "your_password_here" | "changeme"
+    )
 }
 
 fn non_empty_env(key: &str) -> Option<String> {

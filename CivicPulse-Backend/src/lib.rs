@@ -55,7 +55,8 @@ pub async fn build_app(config: Config, repo: PostRepository) -> AppResult<(Route
         config.gemini_endpoint.clone(),
         config.gemini_timeout_secs,
         Arc::clone(&metrics),
-    )?;
+    )?
+    .with_fallback_endpoints(config.gemini_fallback_endpoints.clone());
 
     let webhook_http = Client::builder()
         .timeout(Duration::from_secs(10))

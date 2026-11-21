@@ -1,0 +1,84 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in root .env}
+      POSTGRES_DB: ${POSTGRES_DB:-civicpulse}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-civicpulse}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - civicpulse-net
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  backend:
+    build:
+      context: ./CivicPulse-Backend
+      dockerfile: Dockerfile
+    image: civicpulse-backend:latest
+    restart: unless-stopped
+    init: true
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${BACKEND_BIND_HOST:-127.0.0.1}:${BACKEND_PORT:-8080}:8080"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8080
+      DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in root .env}@db:5432/${POSTGRES_DB:-civicpulse}
+      DATABASE_PATH: /app/data/civicpulse.db
+      UPLOAD_DIR: /app/data/uploads
+      MEDIA_STORAGE_MODE: ${MEDIA_STORAGE_MODE:-file}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_PROJECT: ${GEMINI_PROJECT:-}
+      GEMINI_ENDPOINT: ${GEMINI_ENDPOINT:-https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent}
+      GEMINI_FALLBACK_ENDPOINTS: ${GEMINI_FALLBACK_ENDPOINTS:-https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent,https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent}
+      GEMINI_TIMEOUT_SECS: ${GEMINI_TIMEOUT_SECS:-20}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
+      TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-true}
+      STRICT_UNIQUE_VOTERS: ${STRICT_UNIQUE_VOTERS:-true}
+      SEED_INITIAL_POSTS: ${SEED_INITIAL_POSTS:-false}
+      ALLOW_GUEST_UPLOADS_DEFAULT: ${ALLOW_GUEST_UPLOADS_DEFAULT:-true}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      RUST_LOG: ${RUST_LOG:-civicpulse_backend=info,tower_http=info}
+    volumes:
+      - civicpulse_data:/app/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - civicpulse-net
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  pgdata:
+  civicpulse_data:
+
+networks:
+  civicpulse-net:
+    driver: bridge

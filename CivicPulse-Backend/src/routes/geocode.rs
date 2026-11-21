@@ -29,6 +29,19 @@ const GEOCODE_RATE_LIMIT_PER_MIN: usize = 30;
 const MIN_QUERY_LEN: usize = 2;
 const MAX_QUERY_LEN: usize = 200;
 
+/// Structured Google-Maps-style address breakdown extracted from OpenStreetMap Nominatim.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AddressDetails {
+    pub road: Option<String>,
+    pub suburb: Option<String>,
+    pub city: Option<String>,
+    pub district: Option<String>,
+    pub state: Option<String>,
+    pub postcode: Option<String>,
+    pub country: Option<String>,
+    pub country_code: Option<String>,
+}
+
 /// Public suggestion item returned by `GET /api/geocode/search`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GeocodeSuggestion {
@@ -38,15 +51,19 @@ pub struct GeocodeSuggestion {
     pub lng: f64,
     pub category: Option<String>,
     pub place_type: Option<String>,
+    pub address: AddressDetails,
 }
 
-/// Public reverse-geocoded place label returned by `GET /api/geocode/reverse`.
+/// Public reverse-geocoded place label & structured address returned by `GET /api/geocode/reverse`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReverseGeocodeResponse {
     pub display_name: String,
     pub short_name: String,
     pub lat: f64,
     pub lng: f64,
+    pub category: Option<String>,
+    pub place_type: Option<String>,
+    pub address: AddressDetails,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,6 +89,13 @@ pub struct NominatimAddress {
     pub city: Option<String>,
     pub state_district: Option<String>,
     pub state: Option<String>,
+    pub postcode: Option<String>,
+    pub country: Option<String>,
+    pub country_code: Option<String>,
+    pub amenity: Option<String>,
+    pub tourism: Option<String>,
+    pub natural: Option<String>,
+    pub building: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,6 +116,9 @@ struct NominatimReverseItem {
     lon: Option<String>,
     display_name: Option<String>,
     name: Option<String>,
+    category: Option<String>,
+    #[serde(rename = "type")]
+    place_type: Option<String>,
     address: Option<NominatimAddress>,
 }
 
@@ -209,6 +236,48 @@ fn push_unique_part(parts: &mut Vec<String>, candidate: Option<&str>) {
     }
 }
 
+fn coalesce_trimmed(options: &[Option<&str>]) -> Option<String> {
+    options
+        .iter()
+        .flatten()
+        .map(|s| s.trim())
+        .find(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// Extract structured Google-Maps-style address fields from Nominatim `addressdetails`.
+pub fn build_address_details(address: Option<&NominatimAddress>) -> AddressDetails {
+    let Some(addr) = address else {
+        return AddressDetails::default();
+    };
+    AddressDetails {
+        road: coalesce_trimmed(&[
+            addr.road.as_deref(),
+            addr.amenity.as_deref(),
+            addr.tourism.as_deref(),
+            addr.natural.as_deref(),
+            addr.building.as_deref(),
+        ]),
+        suburb: coalesce_trimmed(&[
+            addr.suburb.as_deref(),
+            addr.neighbourhood.as_deref(),
+            addr.hamlet.as_deref(),
+            addr.village.as_deref(),
+        ]),
+        city: coalesce_trimmed(&[
+            addr.city.as_deref(),
+            addr.town.as_deref(),
+            addr.village.as_deref(),
+        ]),
+        district: coalesce_trimmed(&[addr.state_district.as_deref()]),
+        state: coalesce_trimmed(&[addr.state.as_deref()]),
+        postcode: coalesce_trimmed(&[addr.postcode.as_deref()]),
+        country: coalesce_trimmed(&[addr.country.as_deref()]),
+        country_code: coalesce_trimmed(&[addr.country_code.as_deref()])
+            .map(|code| code.to_ascii_uppercase()),
+    }
+}
+
 /// Build a concise human-readable place label from Nominatim structured address fields,
 /// falling back to the first 2-3 segments of `display_name`.
 pub fn format_short_name(
@@ -318,6 +387,7 @@ async fn query_nominatim_search(
             item.address.as_ref(),
             &item.display_name,
         );
+        let address = build_address_details(item.address.as_ref());
         suggestions.push(GeocodeSuggestion {
             display_name: item.display_name,
             short_name,
@@ -325,6 +395,7 @@ async fn query_nominatim_search(
             lng,
             category: item.category,
             place_type: item.place_type,
+            address,
         });
     }
 
@@ -459,12 +530,16 @@ pub async fn reverse_geocode(
         item.address.as_ref(),
         &display_name,
     );
+    let address = build_address_details(item.address.as_ref());
 
     let response = ReverseGeocodeResponse {
         display_name,
         short_name,
         lat: resolved_lat,
         lng: resolved_lng,
+        category: item.category,
+        place_type: item.place_type,
+        address,
     };
 
     cache_insert(reverse_cache(), cache_key, response.clone());
@@ -474,6 +549,30 @@ pub async fn reverse_geocode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn address_details_extracts_suburb_city_district_postcode_country() {
+        let raw = NominatimAddress {
+            road: Some("Parakrama Road".into()),
+            hamlet: Some("Bendiyamulla".into()),
+            city: Some("Gampaha".into()),
+            state_district: Some("Gampaha District".into()),
+            state: Some("Western Province".into()),
+            postcode: Some("11000".into()),
+            country: Some("Sri Lanka".into()),
+            country_code: Some("lk".into()),
+            ..Default::default()
+        };
+        let details = build_address_details(Some(&raw));
+        assert_eq!(details.road.as_deref(), Some("Parakrama Road"));
+        assert_eq!(details.suburb.as_deref(), Some("Bendiyamulla"));
+        assert_eq!(details.city.as_deref(), Some("Gampaha"));
+        assert_eq!(details.district.as_deref(), Some("Gampaha District"));
+        assert_eq!(details.state.as_deref(), Some("Western Province"));
+        assert_eq!(details.postcode.as_deref(), Some("11000"));
+        assert_eq!(details.country.as_deref(), Some("Sri Lanka"));
+        assert_eq!(details.country_code.as_deref(), Some("LK"));
+    }
 
     #[test]
     fn format_short_name_deduplicates_parts() {

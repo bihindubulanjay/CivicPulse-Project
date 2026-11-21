@@ -386,9 +386,30 @@ impl PostRepository {
         .await
     }
 
-    pub async fn create_user(&self, user: StoredUser) -> AppResult<StoredUser> {
+    /// Return `(has_admin, users_count)` for initial first-run setup detection.
+    pub async fn get_auth_status(&self) -> AppResult<(bool, usize)> {
+        self.with_conn(|conn| {
+            let admins_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM users WHERE role = 'admin'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| AppError::internal(format!("Admin count query error: {e}")))?;
+            let users_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
+                .map_err(|e| AppError::internal(format!("User count query error: {e}")))?;
+            Ok((admins_count > 0, users_count.max(0) as usize))
+        })
+        .await
+    }
+
+    pub async fn create_user(&self, mut user: StoredUser) -> AppResult<StoredUser> {
         self.with_conn(move |conn| {
-            let exists: Option<String> = conn
+            let tx = conn
+                .transaction()
+                .map_err(|e| AppError::internal(format!("User create tx error: {e}")))?;
+            let exists: Option<String> = tx
                 .query_row(
                     "SELECT id FROM users WHERE email = ?1",
                     params![&user.email],
@@ -402,7 +423,21 @@ impl PostRepository {
                     user.email
                 )));
             }
-            conn.execute(
+
+            // First registered user on a clean database automatically bootstraps as Administrator.
+            let existing_admins: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM users WHERE role = 'admin'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| AppError::internal(format!("Admin check error: {e}")))?;
+            if existing_admins == 0 {
+                user.role = UserRole::Admin;
+                user.reputation_score = 100;
+            }
+
+            tx.execute(
                 "INSERT INTO users (id, name, email, role, password_hash, reputation_score, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
@@ -416,6 +451,8 @@ impl PostRepository {
                 ],
             )
             .map_err(|e| AppError::internal(format!("User insert error: {e}")))?;
+            tx.commit()
+                .map_err(|e| AppError::internal(format!("User create commit error: {e}")))?;
             Ok(user)
         })
         .await
@@ -549,6 +586,299 @@ impl PostRepository {
                 )
                 .map_err(|e| AppError::internal(format!("Session cleanup error: {e}")))?;
             Ok(deleted)
+        })
+        .await
+    }
+
+    /// Return `(active_sessions_count, reports_submitted, votes_cast)` for a signed-in user.
+    pub async fn get_user_profile_stats(
+        &self,
+        user_id: &str,
+        now_iso: &str,
+    ) -> AppResult<(usize, usize, usize)> {
+        let user_id = user_id.to_string();
+        let now_iso = now_iso.to_string();
+        let voter_key = format!("user:{user_id}");
+        self.with_conn(move |conn| {
+            let active_sessions: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE user_id = ?1 AND expires_at > ?2",
+                    params![&user_id, &now_iso],
+                    |row| row.get(0),
+                )
+                .map_err(|e| AppError::internal(format!("Profile sessions count error: {e}")))?;
+            let reports_submitted: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM posts WHERE author_user_id = ?1",
+                    params![&user_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| AppError::internal(format!("Profile posts count error: {e}")))?;
+            let votes_cast: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM post_votes WHERE voter_key = ?1",
+                    params![&voter_key],
+                    |row| row.get(0),
+                )
+                .map_err(|e| AppError::internal(format!("Profile votes count error: {e}")))?;
+
+            Ok((
+                active_sessions.max(0) as usize,
+                reports_submitted.max(0) as usize,
+                votes_cast.max(0) as usize,
+            ))
+        })
+        .await
+    }
+
+    /// Revoke every session belonging to `user_id` except `keep_token_hash`.
+    pub async fn revoke_other_sessions(
+        &self,
+        user_id: &str,
+        keep_token_hash: &str,
+    ) -> AppResult<usize> {
+        let user_id = user_id.to_string();
+        let keep_token_hash = keep_token_hash.to_string();
+        self.with_conn(move |conn| {
+            let deleted = conn
+                .execute(
+                    "DELETE FROM sessions WHERE user_id = ?1 AND token_hash != ?2",
+                    params![&user_id, &keep_token_hash],
+                )
+                .map_err(|e| AppError::internal(format!("Revoke sessions error: {e}")))?;
+            Ok(deleted)
+        })
+        .await
+    }
+
+    /// Return all users with live post & active-session counts (never exposes password hashes).
+    pub async fn list_users_with_stats(
+        &self,
+        now_iso: &str,
+    ) -> AppResult<Vec<crate::models::AdminUserSummary>> {
+        let now_iso = now_iso.to_string();
+        self.with_conn(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT u.id, u.name, u.email, u.role, u.reputation_score, u.created_at,
+                            (SELECT COUNT(*) FROM posts p WHERE p.author_user_id = u.id),
+                            (SELECT COUNT(*) FROM sessions s WHERE s.user_id = u.id AND s.expires_at > ?1)
+                     FROM users u
+                     ORDER BY CASE WHEN u.role = 'admin' THEN 0 ELSE 1 END, u.created_at ASC",
+                )
+                .map_err(|e| AppError::internal(format!("List users prepare error: {e}")))?;
+
+            let rows = stmt
+                .query_map(params![&now_iso], |row| {
+                    Ok(crate::models::AdminUserSummary {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        email: row.get(2)?,
+                        role: row.get(3)?,
+                        reputation_score: row.get(4)?,
+                        created_at: row.get(5)?,
+                        posts_count: row.get::<_, i64>(6)?.max(0) as usize,
+                        active_sessions_count: row.get::<_, i64>(7)?.max(0) as usize,
+                    })
+                })
+                .map_err(|e| AppError::internal(format!("List users query error: {e}")))?;
+
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|e| AppError::internal(format!("User summary decode error: {e}")))?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Update a user's role inside a transaction, refusing to demote the last remaining Administrator.
+    pub async fn update_user_role(
+        &self,
+        target_user_id: &str,
+        new_role: UserRole,
+        now_iso: &str,
+    ) -> AppResult<Option<crate::models::AdminUserSummary>> {
+        let target_user_id = target_user_id.to_string();
+        let now_iso = now_iso.to_string();
+        self.with_conn(move |conn| {
+            let tx = conn
+                .transaction()
+                .map_err(|e| AppError::internal(format!("Update role tx error: {e}")))?;
+
+            let Some(current_role_str): Option<String> = tx
+                .query_row(
+                    "SELECT role FROM users WHERE id = ?1",
+                    params![&target_user_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| AppError::internal(format!("Role lookup error: {e}")))?
+            else {
+                return Ok(None);
+            };
+
+            if current_role_str.eq_ignore_ascii_case("admin") && new_role != UserRole::Admin {
+                let admins_count: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM users WHERE role = 'admin'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| AppError::internal(format!("Admin count check error: {e}")))?;
+                if admins_count <= 1 {
+                    return Err(AppError::conflict(
+                        "Cannot demote the last remaining administrator",
+                    ));
+                }
+            }
+
+            tx.execute(
+                "UPDATE users SET role = ?1 WHERE id = ?2",
+                params![new_role.as_str(), &target_user_id],
+            )
+            .map_err(|e| AppError::internal(format!("Role update error: {e}")))?;
+            tx.commit()
+                .map_err(|e| AppError::internal(format!("Role update commit error: {e}")))?;
+
+            conn.query_row(
+                "SELECT u.id, u.name, u.email, u.role, u.reputation_score, u.created_at,
+                        (SELECT COUNT(*) FROM posts p WHERE p.author_user_id = u.id),
+                        (SELECT COUNT(*) FROM sessions s WHERE s.user_id = u.id AND s.expires_at > ?1)
+                 FROM users u WHERE u.id = ?2",
+                params![&now_iso, &target_user_id],
+                |row| {
+                    Ok(crate::models::AdminUserSummary {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        email: row.get(2)?,
+                        role: row.get(3)?,
+                        reputation_score: row.get(4)?,
+                        created_at: row.get(5)?,
+                        posts_count: row.get::<_, i64>(6)?.max(0) as usize,
+                        active_sessions_count: row.get::<_, i64>(7)?.max(0) as usize,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| AppError::internal(format!("Role refetch error: {e}")))
+        })
+        .await
+    }
+
+    /// Return live SQLite table & verification breakdown counts for the Admin DB Overview panel.
+    pub async fn get_admin_database_overview(
+        &self,
+        now_iso: &str,
+    ) -> AppResult<crate::models::DbOverviewCounts> {
+        let now_iso = now_iso.to_string();
+        self.with_conn(move |conn| {
+            let schema_version: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| AppError::internal(format!("Schema version query error: {e}")))?;
+
+            let total_users: i64 = conn
+                .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
+                .map_err(|e| AppError::internal(format!("Users count query error: {e}")))?;
+            let admins_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM users WHERE role = 'admin'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| AppError::internal(format!("Admins count query error: {e}")))?;
+            let active_sessions_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE expires_at > ?1",
+                    params![&now_iso],
+                    |row| row.get(0),
+                )
+                .map_err(|e| AppError::internal(format!("Sessions count query error: {e}")))?;
+            let total_comments: i64 = conn
+                .query_row("SELECT COUNT(*) FROM comments", [], |row| row.get(0))
+                .map_err(|e| AppError::internal(format!("Comments count query error: {e}")))?;
+            let total_votes: i64 = conn
+                .query_row("SELECT COUNT(*) FROM post_votes", [], |row| row.get(0))
+                .map_err(|e| AppError::internal(format!("Votes count query error: {e}")))?;
+            let total_audit_logs: i64 = conn
+                .query_row("SELECT COUNT(*) FROM audit_logs", [], |row| row.get(0))
+                .map_err(|e| AppError::internal(format!("Audit logs count query error: {e}")))?;
+
+            let mut total_posts = 0usize;
+            let mut verified_posts = 0usize;
+            let mut pending_admin_posts = 0usize;
+            let mut quarantined_posts = 0usize;
+            let mut disputed_posts = 0usize;
+            let mut resolved_posts = 0usize;
+
+            let mut stmt = conn
+                .prepare("SELECT verification_status, is_resolved FROM posts")
+                .map_err(|e| AppError::internal(format!("Overview posts prepare error: {e}")))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0))
+                })
+                .map_err(|e| AppError::internal(format!("Overview posts query error: {e}")))?;
+
+            for row in rows {
+                let (status_str, is_resolved) =
+                    row.map_err(|e| AppError::internal(format!("Overview row decode error: {e}")))?;
+                total_posts += 1;
+                if is_resolved {
+                    resolved_posts += 1;
+                }
+                if let Ok(st) = status_str.parse::<VerificationStatus>() {
+                    if st.is_verified() {
+                        verified_posts += 1;
+                    }
+                    match st {
+                        VerificationStatus::PendingAdminApproval => pending_admin_posts += 1,
+                        VerificationStatus::Quarantined => quarantined_posts += 1,
+                        VerificationStatus::Disputed => disputed_posts += 1,
+                        _ => {}
+                    }
+                }
+            }
+
+            Ok(crate::models::DbOverviewCounts {
+                schema_version,
+                total_users: total_users.max(0) as usize,
+                admins_count: admins_count.max(0) as usize,
+                active_sessions_count: active_sessions_count.max(0) as usize,
+                total_posts,
+                verified_posts,
+                pending_admin_posts,
+                quarantined_posts,
+                disputed_posts,
+                resolved_posts,
+                total_comments: total_comments.max(0) as usize,
+                total_votes: total_votes.max(0) as usize,
+                total_audit_logs: total_audit_logs.max(0) as usize,
+            })
+        })
+        .await
+    }
+
+    /// Permanently delete a post and its FTS index entry (cascading comments, votes, and audit logs).
+    pub async fn delete_post(&self, id: &str) -> AppResult<Option<Post>> {
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            let Some(existing) = fetch_post_by_id(conn, &id)? else {
+                return Ok(None);
+            };
+            let tx = conn
+                .transaction()
+                .map_err(|e| AppError::internal(format!("Delete post tx error: {e}")))?;
+            let _ = tx.execute("DELETE FROM posts_fts WHERE post_id = ?1", params![&id]);
+            tx.execute("DELETE FROM posts WHERE id = ?1", params![&id])
+                .map_err(|e| AppError::internal(format!("Delete post error: {e}")))?;
+            tx.commit()
+                .map_err(|e| AppError::internal(format!("Delete post commit error: {e}")))?;
+            Ok(Some(existing))
         })
         .await
     }

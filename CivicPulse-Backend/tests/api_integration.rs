@@ -2591,3 +2591,520 @@ async fn full_security_audit_prevents_double_vote_self_vote_moderation_bypass_an
         .unwrap();
     assert_eq!(guest_comment_blocked.status(), StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn zero_mock_first_run_admin_bootstrap_profile_sessions_and_admin_db_management() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let gemini_ok = json!({
+        "ai_authenticity_score": 90,
+        "ai_reasoning": "Authentic real-time observation.",
+        "translated_description": "Flooding along station road.",
+        "travel_advisory": "Caution",
+        "severity": 6
+    });
+    let endpoint = spawn_gemini_test_server(MockGeminiBehavior {
+        status: StatusCode::OK,
+        response_body: gemini_text_envelope(&gemini_ok.to_string()),
+        captured_requests: Arc::clone(&captured),
+    })
+    .await;
+
+    let repo = PostRepository::open_in_memory().unwrap();
+    let mut cfg = Config::for_test(endpoint, Some("test-key".into()));
+    cfg.seed_initial_posts = false;
+    cfg.admin_seed_email = None;
+    cfg.admin_seed_password = None;
+    cfg.user_seed_email = None;
+    cfg.user_seed_password = None;
+
+    let (app, _) = build_app(cfg, repo).await.unwrap();
+
+    // 1. Clean DB starts with zero posts & no admin yet
+    let empty_posts_res = app
+        .clone()
+        .oneshot(Request::builder().uri("/api/posts").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(empty_posts_res.status(), StatusCode::OK);
+    let empty_posts: Vec<Post> = serde_json::from_value(read_json(empty_posts_res).await).unwrap();
+    assert_eq!(empty_posts.len(), 0);
+
+    let status_before = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status_before.status(), StatusCode::OK);
+    let st_json = read_json(status_before).await;
+    assert_eq!(st_json["has_admin"], false);
+    assert_eq!(st_json["users_count"], 0);
+
+    // 2. First user registered automatically bootstraps as Admin; second becomes User
+    let first_reg = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/auth/register")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-forwarded-for", "198.51.100.220")
+                .body(Body::from(
+                    json!({
+                        "name": "Alice Perera",
+                        "email": "alice@example.com",
+                        "password": "secretpassword1"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_reg.status(), StatusCode::CREATED);
+    let alice = read_json(first_reg).await;
+    assert_eq!(alice["role"], "admin");
+    assert_eq!(alice["reputation_score"], 100);
+    let alice_id = alice["user_id"].as_str().unwrap().to_string();
+    let alice_token = alice["token"].as_str().unwrap().to_string();
+
+    let status_after = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let st_after = read_json(status_after).await;
+    assert_eq!(st_after["has_admin"], true);
+    assert_eq!(st_after["users_count"], 1);
+
+    let second_reg = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/auth/register")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-forwarded-for", "198.51.100.221")
+                .body(Body::from(
+                    json!({
+                        "name": "Bob Fernando",
+                        "email": "bob@example.com",
+                        "password": "secretpassword2"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_reg.status(), StatusCode::CREATED);
+    let bob1 = read_json(second_reg).await;
+    assert_eq!(bob1["role"], "user");
+    assert_eq!(bob1["reputation_score"], 10);
+    let bob_id = bob1["user_id"].as_str().unwrap().to_string();
+    let bob_token_1 = bob1["token"].as_str().unwrap().to_string();
+
+    // 3. Second login creates 2 active sessions; /api/auth/me reflects both & logout-all revokes old one
+    let bob_token_2 = login_token(&app, "bob@example.com", "secretpassword2", "198.51.100.222").await;
+
+    let me_before = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/me")
+                .header(header::AUTHORIZATION, format!("Bearer {bob_token_2}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(me_before.status(), StatusCode::OK);
+    let me_before_json = read_json(me_before).await;
+    assert_eq!(me_before_json["active_sessions_count"], 2);
+    assert_eq!(me_before_json["reports_submitted"], 0);
+    assert_eq!(me_before_json["votes_cast"], 0);
+    assert!(!me_before_json["created_at"].as_str().unwrap().is_empty());
+    assert!(!me_before_json["expires_at"].as_str().unwrap().is_empty());
+
+    let logout_all_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/auth/logout-all")
+                .header(header::AUTHORIZATION, format!("Bearer {bob_token_2}"))
+                .header("x-forwarded-for", "198.51.100.222")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(logout_all_res.status(), StatusCode::OK);
+    let logout_all_json = read_json(logout_all_res).await;
+    assert_eq!(logout_all_json["revoked_sessions"], 1);
+
+    let revoked_check = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/me")
+                .header(header::AUTHORIZATION, format!("Bearer {bob_token_1}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revoked_check.status(), StatusCode::UNAUTHORIZED);
+
+    // 4. Non-admin cannot access /api/admin/overview, /api/admin/users, or DELETE /api/admin/posts/{id}
+    for (method, uri) in [
+        (Method::GET, "/api/admin/overview"),
+        (Method::GET, "/api/admin/users"),
+        (Method::DELETE, "/api/admin/posts/nonexistent"),
+    ] {
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {bob_token_2}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    }
+
+    // 5. Alice creates a post & Bob confirms it -> updates live /me metrics + Admin DB overview
+    let create_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/posts")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {alice_token}"))
+                .header("x-forwarded-for", "198.51.100.223")
+                .body(Body::from(
+                    json!({
+                        "lat": 7.09,
+                        "lng": 80.0,
+                        "title": "Station Road Flood",
+                        "description": "Standing water on lane",
+                        "category": "Road",
+                        "location_name": "Gampaha"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_res.status(), StatusCode::CREATED);
+    let post: Post = serde_json::from_value(read_json(create_res).await).unwrap();
+
+    let vote_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/posts/{}/verify", post.id))
+                .header(header::AUTHORIZATION, format!("Bearer {bob_token_2}"))
+                .header("x-forwarded-for", "198.51.100.224")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(vote_res.status(), StatusCode::OK);
+
+    let bob_me_after = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/me")
+                .header(header::AUTHORIZATION, format!("Bearer {bob_token_2}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bob_me_json = read_json(bob_me_after).await;
+    assert_eq!(bob_me_json["active_sessions_count"], 1);
+    assert_eq!(bob_me_json["votes_cast"], 1);
+
+    let overview_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/admin/overview")
+                .header(header::AUTHORIZATION, format!("Bearer {alice_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(overview_res.status(), StatusCode::OK);
+    let overview = read_json(overview_res).await;
+    assert_eq!(overview["database_engine"], "SQLite (WAL + FTS5)");
+    assert!(overview["counts"]["schema_version"].as_i64().unwrap() >= 4);
+    assert_eq!(overview["counts"]["total_users"], 2);
+    assert_eq!(overview["counts"]["admins_count"], 1);
+    assert_eq!(overview["counts"]["total_posts"], 1);
+    assert_eq!(overview["counts"]["total_votes"], 1);
+
+    let users_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/admin/users")
+                .header(header::AUTHORIZATION, format!("Bearer {alice_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(users_res.status(), StatusCode::OK);
+    let users_list = read_json(users_res).await;
+    assert!(!users_list.to_string().contains("password_hash"));
+    assert_eq!(users_list.as_array().unwrap().len(), 2);
+
+    // 6. Role management: cannot demote last remaining Admin (409), can promote & demote second user
+    let demote_last = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/admin/users/{alice_id}/role"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {alice_token}"))
+                .header("x-forwarded-for", "198.51.100.225")
+                .body(Body::from(json!({ "role": "user" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(demote_last.status(), StatusCode::CONFLICT);
+
+    let promote_bob = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/admin/users/{bob_id}/role"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {alice_token}"))
+                .header("x-forwarded-for", "198.51.100.225")
+                .body(Body::from(json!({ "role": "admin" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(promote_bob.status(), StatusCode::OK);
+    assert_eq!(read_json(promote_bob).await["role"], "admin");
+
+    let demote_bob = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/admin/users/{bob_id}/role"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {alice_token}"))
+                .header("x-forwarded-for", "198.51.100.225")
+                .body(Body::from(json!({ "role": "user" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(demote_bob.status(), StatusCode::OK);
+    assert_eq!(read_json(demote_bob).await["role"], "user");
+
+    // 7. Admin DELETE /api/admin/posts/{id} removes post & cascades votes/audit
+    let del_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/api/admin/posts/{}", post.id))
+                .header(header::AUTHORIZATION, format!("Bearer {alice_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(del_res.status(), StatusCode::OK);
+    assert_eq!(read_json(del_res).await["deleted"], true);
+
+    let after_del_get = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/posts/{}", post.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(after_del_get.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn gemini_multiturn_chat_thought_stripping_and_endpoint_failover() {
+    let captured_fallback = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let state_clone = Arc::clone(&captured_fallback);
+
+    let mock_router = Router::new()
+        .route(
+            "/models/gemini-primary:generateContent",
+            post(|| async {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": { "code": 503, "message": "Overloaded" } })),
+                )
+            }),
+        )
+        .route(
+            "/models/gemini-fallback:generateContent",
+            post(move |Json(body): Json<Value>| {
+                let captured = Arc::clone(&state_clone);
+                async move {
+                    let is_vision = body["generationConfig"]["responseMimeType"] == "application/json";
+                    captured.lock().unwrap().push(body);
+                    let reply_part = if is_vision {
+                        json!({
+                            "ai_authenticity_score": 91,
+                            "ai_reasoning": "Live hillside image shows blocked drainage.",
+                            "translated_description": "Culvert blocked near Ella",
+                            "travel_advisory": "Caution",
+                            "severity": 6
+                        })
+                        .to_string()
+                    } else {
+                        "Follow-up guidance: avoid steep shortcuts near Ella Rock.".to_string()
+                    };
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "candidates": [{
+                                "content": {
+                                    "parts": [
+                                        { "text": "thinking notes should be stripped", "thought": true },
+                                        { "text": reply_part }
+                                    ]
+                                }
+                            }]
+                        })),
+                    )
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_router).await.unwrap();
+    });
+
+    let repo = PostRepository::open_in_memory().unwrap();
+    let mut config = Config::for_test(
+        format!("http://{addr}/models/gemini-primary:generateContent"),
+        Some("test-api-key".into()),
+    );
+    config.gemini_fallback_endpoints = vec![format!(
+        "http://{addr}/models/gemini-fallback:generateContent"
+    )];
+
+    let (app, _) = build_app(config, repo).await.unwrap();
+
+    // 1. /health reports gemini_configured + primary model name
+    let health_res = app
+        .clone()
+        .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(health_res.status(), StatusCode::OK);
+    let health = read_json(health_res).await;
+    assert_eq!(health["gemini_configured"], true);
+    assert_eq!(health["gemini_model"], "gemini-primary");
+
+    // 2. Multi-turn chat fails over from primary 503 -> fallback, forwards history, strips thought parts
+    let chat_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/ai/chat")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "message": "What about tonight?",
+                        "history": [
+                            { "role": "user", "text": "Is Ella safe?" },
+                            { "role": "model", "text": "Mist and mudslide warning on Ella Rock." }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chat_res.status(), StatusCode::OK);
+    let chat_body: AiChatResponse = serde_json::from_value(read_json(chat_res).await).unwrap();
+    assert!(!chat_body.fallback_used);
+    assert_eq!(chat_body.model_used.as_deref(), Some("gemini-fallback"));
+    assert_eq!(
+        chat_body.reply,
+        "Follow-up guidance: avoid steep shortcuts near Ella Rock."
+    );
+    assert!(!chat_body.reply.contains("thinking notes"));
+
+    // 3. Vision post fails over to fallback & parses JSON even when thought part is present
+    let user_token = login_token(&app, "user@civicpulse.org", "user123", "198.51.100.215").await;
+    let png_b64 = BASE64_STANDARD.encode(b"\x89PNG\r\n\x1a\nvalid");
+    let post_res = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/posts")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {user_token}"))
+                .body(Body::from(
+                    json!({
+                        "lat": 6.8667,
+                        "lng": 81.0466,
+                        "title": "Ella Culvert Overflow",
+                        "description": "Blocked hillside culvert",
+                        "category": "Road",
+                        "location_name": "Ella, Sri Lanka",
+                        "media_base64": format!("data:image/png;base64,{png_b64}"),
+                        "is_live_captured": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(post_res.status(), StatusCode::CREATED);
+    let created: Post = serde_json::from_value(read_json(post_res).await).unwrap();
+    assert_eq!(created.ai_authenticity_score, 91);
+    assert_eq!(created.translated_description, "Culvert blocked near Ella");
+
+    let recorded = captured_fallback.lock().unwrap();
+    assert_eq!(recorded.len(), 2);
+    // Multi-turn contents: [grounding user, grounding model, hist user, hist model, new user] = 5 turns
+    assert_eq!(recorded[0]["contents"].as_array().unwrap().len(), 5);
+}

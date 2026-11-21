@@ -21,6 +21,8 @@ export type LayoutMode = 'split' | 'map' | 'feed';
 
 export type MobileTab = 'feed' | 'map' | 'admin';
 
+export type GpsStatus = 'idle' | 'locating' | 'live' | 'denied' | 'unavailable';
+
 export interface Comment {
   author: string;
   text: string;
@@ -98,15 +100,62 @@ export interface AuthSession {
 }
 
 export interface CurrentUser {
-  user_id?: string;
+  user_id: string;
   role: UserRole;
   name: string;
   email: string;
   reputation_score: number;
+  created_at: string;
+  expires_at: string;
+  active_sessions_count: number;
+  reports_submitted: number;
+  votes_cast: number;
+}
+
+export interface AuthStatusResponse {
+  has_admin: boolean;
+  users_count: number;
 }
 
 export interface AdminSettings {
   allow_guest_uploads: boolean;
+}
+
+export interface AdminUserSummary {
+  id: string;
+  name: string;
+  email: string;
+  role: UserRole;
+  reputation_score: number;
+  created_at: string;
+  posts_count: number;
+  active_sessions_count: number;
+}
+
+export interface DbOverviewCounts {
+  schema_version: number;
+  total_users: number;
+  admins_count: number;
+  active_sessions_count: number;
+  total_posts: number;
+  verified_posts: number;
+  pending_admin_posts: number;
+  quarantined_posts: number;
+  disputed_posts: number;
+  resolved_posts: number;
+  total_comments: number;
+  total_votes: number;
+  total_audit_logs: number;
+}
+
+export interface AdminDatabaseOverview {
+  database_engine: string;
+  database_path: string;
+  counts: DbOverviewCounts;
+  allow_guest_uploads: boolean;
+  strict_unique_voters: boolean;
+  geofence_radius_km: number;
+  gemini_configured: boolean;
 }
 
 export interface HealthResponse {
@@ -115,6 +164,7 @@ export interface HealthResponse {
   version: string;
   posts_count: number;
   gemini_configured: boolean;
+  gemini_model?: string | null;
   geofence_radius_km: number;
   rate_limit_post_per_min: number;
   allow_guest_uploads: boolean;
@@ -138,11 +188,17 @@ export interface ChatSourceSummary {
   is_resolved: boolean;
 }
 
+export interface ChatHistoryTurn {
+  role: 'user' | 'model';
+  text: string;
+}
+
 export interface AiChatResponse {
   reply: string;
   referenced_posts_count: number;
   sources: ChatSourceSummary[];
   fallback_used: boolean;
+  model_used?: string | null;
 }
 
 export interface OfflineQueuedReport {
@@ -151,18 +207,21 @@ export interface OfflineQueuedReport {
   payload: CreatePostRequest;
 }
 
-export interface QuickLocation {
-  id: string;
-  label: string;
-  lat: number;
-  lng: number;
-  zoom: number;
-}
-
 export interface UserCoords {
   lat: number;
   lng: number;
   accuracy?: number;
+}
+
+export interface AddressDetails {
+  road?: string | null;
+  suburb?: string | null;
+  city?: string | null;
+  district?: string | null;
+  state?: string | null;
+  postcode?: string | null;
+  country?: string | null;
+  country_code?: string | null;
 }
 
 export interface GeocodeSuggestion {
@@ -172,6 +231,7 @@ export interface GeocodeSuggestion {
   lng: number;
   category: string | null;
   place_type: string | null;
+  address?: AddressDetails;
 }
 
 export interface ReverseGeocodeResponse {
@@ -179,4 +239,7 @@ export interface ReverseGeocodeResponse {
   short_name: string;
   lat: number;
   lng: number;
+  category?: string | null;
+  place_type?: string | null;
+  address?: AddressDetails;
 }

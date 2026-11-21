@@ -1,6 +1,5 @@
 import {
   CloudOff,
-  Compass,
   Crosshair,
   LayoutGrid,
   List,
@@ -8,6 +7,7 @@ import {
   LogOut,
   Map as MapIcon,
   Plus,
+  Radio,
   RefreshCw,
   Search,
   Shield,
@@ -16,13 +16,14 @@ import {
   UserCheck,
   X,
 } from 'lucide-react';
-import { QUICK_JUMP_LOCATIONS } from '../lib/geo';
+import { formatAccuracyMeters } from '../lib/geo';
 import type {
   AuthSession,
   Category,
+  GpsStatus,
   LayoutMode,
-  QuickLocation,
   SortMode,
+  UserCoords,
 } from '../types/civicpulse';
 
 const CATEGORIES: Array<'All' | Category> = ['All', 'Disaster', 'Nature', 'Tourism', 'Road'];
@@ -46,12 +47,13 @@ interface TopNavBarProps {
   onSortModeChange: (sort: SortMode) => void;
   layoutMode: LayoutMode;
   onLayoutModeChange: (mode: LayoutMode) => void;
-  userCoords: { lat: number; lng: number } | null;
-  gpsLoading: boolean;
+  userCoords: UserCoords | null;
+  gpsStatus: GpsStatus;
+  gpsTracking: boolean;
+  liveLocationLabel: string | null;
   onRequestGps: () => void;
+  onToggleGpsTracking: () => void;
   onClearGps: () => void;
-  selectedQuickJumpId: string;
-  onQuickJump: (loc: QuickLocation) => void;
   offlineQueueCount: number;
   isSyncingOffline: boolean;
   onSyncOffline: () => void;
@@ -61,6 +63,7 @@ interface TopNavBarProps {
   adminViewActive: boolean;
   onToggleAdminView: () => void;
   onOpenAuth: () => void;
+  onOpenAccount: () => void;
   onLogout: () => void;
   onOpenReport: () => void;
 }
@@ -77,11 +80,12 @@ export function TopNavBar({
   layoutMode,
   onLayoutModeChange,
   userCoords,
-  gpsLoading,
+  gpsStatus,
+  gpsTracking,
+  liveLocationLabel,
   onRequestGps,
+  onToggleGpsTracking,
   onClearGps,
-  selectedQuickJumpId,
-  onQuickJump,
   offlineQueueCount,
   isSyncingOffline,
   onSyncOffline,
@@ -91,13 +95,23 @@ export function TopNavBar({
   adminViewActive,
   onToggleAdminView,
   onOpenAuth,
+  onOpenAccount,
   onLogout,
   onOpenReport,
 }: TopNavBarProps) {
+  const locating = gpsStatus === 'locating';
+  const gpsSummary = liveLocationLabel
+    ? userCoords?.accuracy !== undefined && Number.isFinite(userCoords.accuracy)
+      ? `${liveLocationLabel} (${formatAccuracyMeters(userCoords.accuracy)})`
+      : liveLocationLabel
+    : userCoords
+      ? `${userCoords.lat.toFixed(3)}, ${userCoords.lng.toFixed(3)}`
+      : 'GPS Active';
+
   return (
     <header className="sticky top-0 z-30 border-b border-slate-200/80 bg-white/85 backdrop-blur-xl">
       <div className="mx-auto max-w-[1600px] px-3 py-2.5 sm:px-5">
-        {/* Primary Row: Branding, Search, GPS, Auth & Report CTA */}
+        {/* Primary Row: Branding, Search, Live GPS, Auth & Report CTA */}
         <div className="flex flex-wrap items-center gap-2.5 lg:gap-3">
           {/* Brand */}
           <div className="flex items-center gap-2.5 pr-1">
@@ -148,7 +162,7 @@ export function TopNavBar({
               value={search}
               onChange={(e) => onSearchChange(e.target.value)}
               enterKeyHint="search"
-              placeholder="Search Ella, landslide, flood, Sinhala or English..."
+              placeholder="Search incidents, roads, Sinhala or English..."
               aria-label="Search incident location or keywords"
               className="w-full rounded-xl border border-slate-200 bg-slate-50/80 py-2 pl-9 pr-8 text-sm text-slate-900 placeholder:text-slate-400 transition focus:border-sky-500 focus:bg-white focus:outline-none focus:ring-2 focus:ring-sky-500/20"
             />
@@ -164,25 +178,45 @@ export function TopNavBar({
             ) : null}
           </div>
 
-          {/* Use My Location + Quick Jump */}
+          {/* Real Live Location Pill */}
           <div className="flex items-center gap-1.5">
             {userCoords ? (
-              <div className="inline-flex items-center rounded-xl border border-sky-200 bg-sky-50 text-xs font-semibold text-sky-800">
+              <div className="inline-flex items-center rounded-xl border border-sky-200 bg-sky-50 text-xs font-semibold text-sky-900">
                 <button
                   type="button"
                   onClick={onRequestGps}
-                  disabled={gpsLoading}
-                  className="inline-flex items-center gap-1.5 px-2.5 py-2 transition hover:bg-sky-100/70 rounded-l-xl"
-                  title={`GPS Active: ${userCoords.lat.toFixed(4)}, ${userCoords.lng.toFixed(4)}`}
+                  disabled={locating}
+                  className="inline-flex items-center gap-1.5 rounded-l-xl px-2.5 py-2 transition hover:bg-sky-100/70"
+                  title={`Live Coordinates: ${userCoords.lat.toFixed(5)}, ${userCoords.lng.toFixed(5)}`}
                 >
-                  <Crosshair className="h-3.5 w-3.5 text-sky-600" aria-hidden="true" />
-                  <span className="hidden sm:inline">GPS Locked</span>
+                  <Crosshair
+                    className={`h-3.5 w-3.5 shrink-0 text-sky-600 ${locating ? 'animate-spin' : ''}`}
+                    aria-hidden="true"
+                  />
+                  <span className="hidden max-w-[190px] truncate sm:inline">{gpsSummary}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={onToggleGpsTracking}
+                  aria-pressed={gpsTracking}
+                  title={gpsTracking ? 'Live GPS Watch: ON' : 'Enable Continuous Live GPS Watch'}
+                  className={`inline-flex items-center gap-1 border-l border-sky-200 px-2 py-2 text-[11px] font-bold transition ${
+                    gpsTracking
+                      ? 'bg-emerald-600 text-white hover:bg-emerald-700'
+                      : 'text-sky-700 hover:bg-sky-100/70'
+                  }`}
+                >
+                  <Radio
+                    className={`h-3 w-3 ${gpsTracking ? 'animate-pulse' : ''}`}
+                    aria-hidden="true"
+                  />
+                  <span className="hidden md:inline">{gpsTracking ? 'Tracking' : 'Watch'}</span>
                 </button>
                 <button
                   type="button"
                   onClick={onClearGps}
                   aria-label="Clear GPS location"
-                  className="border-l border-sky-200 px-2 py-2 text-sky-600 hover:bg-sky-100/70 rounded-r-xl"
+                  className="rounded-r-xl border-l border-sky-200 px-2 py-2 text-sky-600 hover:bg-sky-100/70"
                 >
                   <X className="h-3.5 w-3.5" aria-hidden="true" />
                 </button>
@@ -191,41 +225,19 @@ export function TopNavBar({
               <button
                 type="button"
                 onClick={onRequestGps}
-                disabled={gpsLoading}
+                disabled={locating}
                 className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 shadow-sm transition hover:border-sky-300 hover:bg-sky-50/60 hover:text-sky-700 disabled:opacity-60"
               >
                 <Crosshair
-                  className={`h-3.5 w-3.5 ${gpsLoading ? 'animate-spin text-sky-600' : 'text-slate-500'}`}
+                  className={`h-3.5 w-3.5 ${locating ? 'animate-spin text-sky-600' : 'text-slate-500'}`}
                   aria-hidden="true"
                 />
-                <span>{gpsLoading ? 'Locating...' : 'Use My Location'}</span>
+                <span>{locating ? 'Fetching Live Location...' : 'Fetch Live Location'}</span>
               </button>
             )}
-
-            <div className="relative flex items-center">
-              <Compass
-                className="pointer-events-none absolute left-2.5 h-3.5 w-3.5 text-slate-400"
-                aria-hidden="true"
-              />
-              <select
-                aria-label="Quick Jump Location"
-                value={selectedQuickJumpId}
-                onChange={(e) => {
-                  const found = QUICK_JUMP_LOCATIONS.find((l) => l.id === e.target.value);
-                  if (found) onQuickJump(found);
-                }}
-                className="rounded-xl border border-slate-200 bg-white py-2 pl-8 pr-7 text-xs font-semibold text-slate-700 shadow-sm transition hover:border-slate-300 focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/20"
-              >
-                {QUICK_JUMP_LOCATIONS.map((loc) => (
-                  <option key={loc.id} value={loc.id}>
-                    {loc.label}
-                  </option>
-                ))}
-              </select>
-            </div>
           </div>
 
-          {/* Right Controls: Offline Queue, Auth, Admin, Report CTA */}
+          {/* Right Controls: Offline Queue, Auth/Account, Admin, Report CTA */}
           <div className="ml-auto flex flex-wrap items-center gap-2">
             {offlineQueueCount > 0 ? (
               <button
@@ -261,28 +273,35 @@ export function TopNavBar({
                   </button>
                 ) : null}
 
-                <div className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-xs">
-                  <UserCheck
-                    className={`h-3.5 w-3.5 ${
-                      session.role === 'admin' ? 'text-indigo-600' : 'text-emerald-600'
-                    }`}
-                    aria-hidden="true"
-                  />
-                  <div className="hidden leading-tight xl:block">
-                    <div className="font-semibold text-slate-800">{session.name}</div>
-                    <div className="text-[10px] font-medium uppercase tracking-wide text-slate-500">
-                      {session.role} · Rep {session.reputation_score}
+                <div className="inline-flex items-center rounded-xl border border-slate-200 bg-slate-50 text-xs">
+                  <button
+                    type="button"
+                    onClick={onOpenAccount}
+                    title="Open Account Details, Stats & Security"
+                    className="inline-flex items-center gap-2 rounded-l-xl px-2.5 py-1.5 text-left transition hover:bg-white"
+                  >
+                    <UserCheck
+                      className={`h-3.5 w-3.5 ${
+                        session.role === 'admin' ? 'text-indigo-600' : 'text-emerald-600'
+                      }`}
+                      aria-hidden="true"
+                    />
+                    <div className="hidden leading-tight xl:block">
+                      <div className="font-semibold text-slate-800">{session.name}</div>
+                      <div className="text-[10px] font-medium uppercase tracking-wide text-slate-500">
+                        {session.role} · Rep {session.reputation_score}
+                      </div>
                     </div>
-                  </div>
-                  <span className="font-semibold capitalize text-slate-700 xl:hidden">
-                    {session.role}
-                  </span>
+                    <span className="font-semibold capitalize text-slate-700 xl:hidden">
+                      {session.role}
+                    </span>
+                  </button>
                   <button
                     type="button"
                     onClick={onLogout}
                     aria-label="Sign out"
                     title="Sign out"
-                    className="rounded-lg p-1 text-slate-400 transition hover:bg-white hover:text-rose-600"
+                    className="rounded-r-xl border-l border-slate-200 p-2 text-slate-400 transition hover:bg-white hover:text-rose-600"
                   >
                     <LogOut className="h-3.5 w-3.5" aria-hidden="true" />
                   </button>
@@ -295,7 +314,7 @@ export function TopNavBar({
                 className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 shadow-sm transition hover:border-indigo-300 hover:bg-indigo-50/60 hover:text-indigo-700"
               >
                 <LogIn className="h-3.5 w-3.5" aria-hidden="true" />
-                <span>Guest · Sign In</span>
+                <span>Sign In / Register</span>
               </button>
             )}
 
@@ -358,7 +377,7 @@ export function TopNavBar({
                 <option value="newest">Newest</option>
                 <option value="priority">Priority Risk</option>
                 <option value="severity">Highest Severity</option>
-                {userCoords ? <option value="nearest">Nearest GPS</option> : null}
+                {userCoords ? <option value="nearest">Nearest Live GPS</option> : null}
               </select>
             </label>
 

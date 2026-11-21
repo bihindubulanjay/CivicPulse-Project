@@ -15,6 +15,7 @@ import {
   Upload,
 } from 'lucide-react';
 import { apiClient, ApiError } from '../lib/api';
+import { formatAccuracyMeters } from '../lib/geo';
 import { compressFileToJpegDataUrl, enqueueOfflineReport } from '../lib/offlineQueue';
 import type {
   AuthSession,
@@ -22,6 +23,7 @@ import type {
   CreatePostRequest,
   GeocodeSuggestion,
   Post,
+  ReverseGeocodeResponse,
   UserCoords,
 } from '../types/civicpulse';
 import { LocationPickerMap, type PickerViewTarget } from './LocationPickerMap';
@@ -31,7 +33,7 @@ import { useToast } from './ToastProvider';
 type LocationSource = 'default' | 'gps' | 'search' | 'map' | 'manual';
 
 const SOURCE_LABELS: Record<LocationSource, string> = {
-  default: 'Default Map Center',
+  default: 'Awaiting Pin',
   gps: 'Live GPS',
   search: 'Place Search',
   map: 'Map Pin',
@@ -43,9 +45,11 @@ interface ReportIncidentModalProps {
   session: AuthSession | null;
   allowGuestUploads: boolean;
   userCoords: UserCoords | null;
-  defaultLat: number;
-  defaultLng: number;
+  liveLocationDetails?: ReverseGeocodeResponse | null;
+  defaultLat?: number;
+  defaultLng?: number;
   initialPin?: { lat: number; lng: number } | null;
+  initialAddressDetails?: ReverseGeocodeResponse | null;
   onGpsDetected: (coords: UserCoords) => void;
   onClose: () => void;
   onOpenAuth: () => void;
@@ -54,21 +58,16 @@ interface ReportIncidentModalProps {
   onGuestPolicySynced: (allowed: boolean) => void;
 }
 
-function formatAccuracyLabel(meters: number): string {
-  if (meters >= 1000) {
-    return `${(meters / 1000).toFixed(1)} km`;
-  }
-  return `${Math.round(meters)} m`;
-}
-
 export function ReportIncidentModal({
   open,
   session,
   allowGuestUploads,
   userCoords,
-  defaultLat,
-  defaultLng,
-  initialPin,
+  liveLocationDetails = null,
+  defaultLat = 7.8731,
+  defaultLng = 80.7718,
+  initialPin = null,
+  initialAddressDetails = null,
   onGpsDetected,
   onClose,
   onOpenAuth,
@@ -85,11 +84,12 @@ export function ReportIncidentModal({
   const [lat, setLat] = useState(() => defaultLat.toFixed(6));
   const [lng, setLng] = useState(() => defaultLng.toFixed(6));
 
-  // Location Picker State
+  // Location Picker & Structured Address State
   const [locationSource, setLocationSource] = useState<LocationSource>('default');
   const [gpsAccuracy, setGpsAccuracy] = useState<number | null>(null);
   const [detectingGps, setDetectingGps] = useState(false);
   const [pickerViewTarget, setPickerViewTarget] = useState<PickerViewTarget | null>(null);
+  const [resolvedDetails, setResolvedDetails] = useState<ReverseGeocodeResponse | null>(null);
 
   const [placeQuery, setPlaceQuery] = useState('');
   const [searchingPlaces, setSearchingPlaces] = useState(false);
@@ -142,38 +142,104 @@ export function ReportIncidentModal({
     setCameraActive(false);
   }, []);
 
-  const triggerReverseGeocode = useCallback((targetLat: number, targetLng: number) => {
-    reverseAbortRef.current?.abort();
-    const controller = new AbortController();
-    reverseAbortRef.current = controller;
-    setReversingPlace(true);
-
-    apiClient
-      .geocodeReverse(targetLat, targetLng, controller.signal)
-      .then((res) => {
-        if (controller.signal.aborted) return;
-        const label = res.short_name?.trim();
-        if (!label) return;
-        if (!locationNameRef.current.trim() || locationNameAutoFilledRef.current) {
-          setLocationName(label);
-          locationNameAutoFilledRef.current = true;
-          setReverseSuggestion(null);
-        } else if (label.toLowerCase() !== locationNameRef.current.trim().toLowerCase()) {
-          setReverseSuggestion(label);
-        } else {
-          setReverseSuggestion(null);
-        }
-      })
-      .catch((err) => {
-        if (err instanceof DOMException && err.name === 'AbortError') return;
-        // Reverse geocode failure is non-fatal; keep existing location label
-      })
-      .finally(() => {
-        if (reverseAbortRef.current === controller) {
-          setReversingPlace(false);
-        }
-      });
+  const applyReverseResult = useCallback((res: ReverseGeocodeResponse) => {
+    setResolvedDetails(res);
+    const label = res.short_name?.trim();
+    if (!label) return;
+    if (!locationNameRef.current.trim() || locationNameAutoFilledRef.current) {
+      setLocationName(label);
+      locationNameAutoFilledRef.current = true;
+      setReverseSuggestion(null);
+    } else if (label.toLowerCase() !== locationNameRef.current.trim().toLowerCase()) {
+      setReverseSuggestion(label);
+    } else {
+      setReverseSuggestion(null);
+    }
   }, []);
+
+  const triggerReverseGeocode = useCallback(
+    (targetLat: number, targetLng: number) => {
+      reverseAbortRef.current?.abort();
+      const controller = new AbortController();
+      reverseAbortRef.current = controller;
+      setReversingPlace(true);
+
+      apiClient
+        .geocodeReverse(targetLat, targetLng, controller.signal)
+        .then((res) => {
+          if (controller.signal.aborted) return;
+          applyReverseResult(res);
+        })
+        .catch((err) => {
+          if (err instanceof DOMException && err.name === 'AbortError') return;
+        })
+        .finally(() => {
+          if (reverseAbortRef.current === controller) {
+            setReversingPlace(false);
+          }
+        });
+    },
+    [applyReverseResult],
+  );
+
+  const detectGpsInModal = useCallback(
+    (opts?: { quietOnError?: boolean }) => {
+      if (!navigator.geolocation) {
+        if (!opts?.quietOnError) {
+          pushToast({ tone: 'error', title: 'Geolocation is unsupported in this browser' });
+        }
+        return;
+      }
+      setDetectingGps(true);
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          const coords: UserCoords = {
+            lat: pos.coords.latitude,
+            lng: pos.coords.longitude,
+            accuracy: pos.coords.accuracy,
+          };
+          const coarse = coords.accuracy !== undefined && coords.accuracy > 500;
+          setDetectingGps(false);
+          onGpsDetected(coords);
+          setLat(coords.lat.toFixed(6));
+          setLng(coords.lng.toFixed(6));
+          setLocationSource('gps');
+          setGpsAccuracy(coords.accuracy ?? null);
+          setShowSuggestions(false);
+          setPickerViewTarget({
+            lat: coords.lat,
+            lng: coords.lng,
+            zoom: coarse ? 13 : 16,
+            nonce: Date.now(),
+          });
+          triggerReverseGeocode(coords.lat, coords.lng);
+          if (!opts?.quietOnError) {
+            pushToast({
+              tone: coarse ? 'warning' : 'success',
+              title: coarse
+                ? `Approximate GPS detected (${formatAccuracyMeters(coords.accuracy!)})`
+                : 'Live GPS location locked',
+              description: coarse
+                ? 'Desktop Wi-Fi/IP location may be broad — drag the pin or search exact street.'
+                : `${coords.lat.toFixed(5)}, ${coords.lng.toFixed(5)}`,
+            });
+          }
+        },
+        (err) => {
+          setDetectingGps(false);
+          if (!opts?.quietOnError) {
+            pushToast({
+              tone: 'warning',
+              title: 'Could not read device GPS',
+              description: `${err.message}. Search an address or click the map instead.`,
+            });
+          }
+        },
+        { enableHighAccuracy: true, timeout: 12_000, maximumAge: 0 },
+      );
+    },
+    [onGpsDetected, pushToast, triggerReverseGeocode],
+  );
 
   // Initialize pin position ONLY when `open` transitions from false -> true
   useEffect(() => {
@@ -210,7 +276,11 @@ export function ReportIncidentModal({
         zoom: 16,
         nonce: Date.now(),
       });
-      triggerReverseGeocode(initialPin.lat, initialPin.lng);
+      if (initialAddressDetails) {
+        applyReverseResult(initialAddressDetails);
+      } else {
+        triggerReverseGeocode(initialPin.lat, initialPin.lng);
+      }
     } else if (userCoords) {
       const coarse = userCoords.accuracy !== undefined && userCoords.accuracy > 500;
       setLat(userCoords.lat.toFixed(6));
@@ -223,22 +293,39 @@ export function ReportIncidentModal({
         zoom: coarse ? 13 : 16,
         nonce: Date.now(),
       });
-      triggerReverseGeocode(userCoords.lat, userCoords.lng);
+      if (liveLocationDetails) {
+        applyReverseResult(liveLocationDetails);
+      } else {
+        triggerReverseGeocode(userCoords.lat, userCoords.lng);
+      }
     } else {
-      const isCountryCenter =
-        Math.abs(defaultLat - 7.45) < 0.0005 && Math.abs(defaultLng - 80.55) < 0.0005;
       setLat(defaultLat.toFixed(6));
       setLng(defaultLng.toFixed(6));
       setLocationSource('default');
       setGpsAccuracy(null);
+      setResolvedDetails(null);
       setPickerViewTarget({
         lat: defaultLat,
         lng: defaultLng,
-        zoom: isCountryCenter ? 8 : 13,
+        zoom: 7,
         nonce: Date.now(),
       });
+      // Automatically fetch live device GPS when opening without prior coordinates
+      detectGpsInModal({ quietOnError: true });
     }
-  }, [open, initialPin, userCoords, defaultLat, defaultLng, stopCamera, triggerReverseGeocode]);
+  }, [
+    open,
+    initialPin,
+    initialAddressDetails,
+    userCoords,
+    liveLocationDetails,
+    defaultLat,
+    defaultLng,
+    stopCamera,
+    applyReverseResult,
+    triggerReverseGeocode,
+    detectGpsInModal,
+  ]);
 
   // Refresh guest upload policy separately without resetting coordinates
   useEffect(() => {
@@ -284,7 +371,7 @@ export function ReportIncidentModal({
       setSuggestions(results);
       setShowSuggestions(true);
       if (results.length === 0) {
-        setSearchError('No matching places found — try adding district or road name.');
+        setSearchError('No matching places found — try adding street, town, or district.');
       }
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') return;
@@ -299,7 +386,6 @@ export function ReportIncidentModal({
     }
   }, []);
 
-  // Debounced live autocomplete as user types in place search
   useEffect(() => {
     if (!open) return;
     if (suppressNextSearchEffectRef.current) {
@@ -334,6 +420,15 @@ export function ReportIncidentModal({
     setLocationSource('search');
     setGpsAccuracy(null);
     setReverseSuggestion(null);
+    setResolvedDetails({
+      display_name: item.display_name,
+      short_name: item.short_name,
+      lat: item.lat,
+      lng: item.lng,
+      category: item.category,
+      place_type: item.place_type,
+      address: item.address,
+    });
     setSuggestions([]);
     setShowSuggestions(false);
     setSearchError(null);
@@ -359,56 +454,6 @@ export function ReportIncidentModal({
     }, 250);
   }
 
-  function handleDetectGpsInModal() {
-    if (!navigator.geolocation) {
-      pushToast({ tone: 'error', title: 'Geolocation is unsupported in this browser' });
-      return;
-    }
-    setDetectingGps(true);
-    navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        const coords: UserCoords = {
-          lat: pos.coords.latitude,
-          lng: pos.coords.longitude,
-          accuracy: pos.coords.accuracy,
-        };
-        const coarse = coords.accuracy !== undefined && coords.accuracy > 500;
-        setDetectingGps(false);
-        onGpsDetected(coords);
-        setLat(coords.lat.toFixed(6));
-        setLng(coords.lng.toFixed(6));
-        setLocationSource('gps');
-        setGpsAccuracy(coords.accuracy ?? null);
-        setShowSuggestions(false);
-        setPickerViewTarget({
-          lat: coords.lat,
-          lng: coords.lng,
-          zoom: coarse ? 13 : 16,
-          nonce: Date.now(),
-        });
-        triggerReverseGeocode(coords.lat, coords.lng);
-        pushToast({
-          tone: coarse ? 'warning' : 'success',
-          title: coarse
-            ? `Approximate GPS detected (±${formatAccuracyLabel(coords.accuracy!)})`
-            : 'Exact GPS location locked',
-          description: coarse
-            ? 'Desktop Wi-Fi/IP location may be imprecise — drag the pin or search exact street.'
-            : `${coords.lat.toFixed(5)}, ${coords.lng.toFixed(5)}`,
-        });
-      },
-      (err) => {
-        setDetectingGps(false);
-        pushToast({
-          tone: 'warning',
-          title: 'Could not read device GPS',
-          description: `${err.message}. Search a place name or click the map instead.`,
-        });
-      },
-      { enableHighAccuracy: true, timeout: 12_000, maximumAge: 0 },
-    );
-  }
-
   async function handleLocateByLocationName() {
     const query = locationName.trim();
     if (query.length < 2 || locatingName) {
@@ -431,6 +476,15 @@ export function ReportIncidentModal({
       setLng(best.lng.toFixed(6));
       setLocationSource('search');
       setGpsAccuracy(null);
+      setResolvedDetails({
+        display_name: best.display_name,
+        short_name: best.short_name,
+        lat: best.lat,
+        lng: best.lng,
+        category: best.category,
+        place_type: best.place_type,
+        address: best.address,
+      });
       setPickerViewTarget({ lat: best.lat, lng: best.lng, zoom: 15, nonce: Date.now() });
 
       if (results.length > 1) {
@@ -562,6 +616,7 @@ export function ReportIncidentModal({
     setShowSuggestions(false);
     setSearchError(null);
     setReverseSuggestion(null);
+    setResolvedDetails(null);
     setGpsAccuracy(null);
     setMediaDataUri(null);
     setIsLiveCaptured(false);
@@ -648,9 +703,19 @@ export function ReportIncidentModal({
   const numericLng = Number(lng);
   const validPinLat = Number.isFinite(numericLat) && numericLat >= -90 && numericLat <= 90 ? numericLat : defaultLat;
   const validPinLng = Number.isFinite(numericLng) && numericLng >= -180 && numericLng <= 180 ? numericLng : defaultLng;
-  const isAtCountryCenter =
-    Math.abs(validPinLat - 7.45) < 0.0005 && Math.abs(validPinLng - 80.55) < 0.0005;
   const isCoarseGps = locationSource === 'gps' && gpsAccuracy !== null && gpsAccuracy > 500;
+
+  const addressFields = resolvedDetails?.address
+    ? [
+        { label: 'Road / Place', value: resolvedDetails.address.road },
+        { label: 'Area / Suburb', value: resolvedDetails.address.suburb },
+        { label: 'City / Town', value: resolvedDetails.address.city },
+        { label: 'District', value: resolvedDetails.address.district },
+        { label: 'Province / State', value: resolvedDetails.address.state },
+        { label: 'Postcode', value: resolvedDetails.address.postcode },
+        { label: 'Country', value: resolvedDetails.address.country },
+      ].filter((item): item is { label: string; value: string } => Boolean(item.value))
+    : [];
 
   return (
     <ModalDialog
@@ -670,7 +735,7 @@ export function ReportIncidentModal({
           <h3 className="mt-3 text-base font-bold text-slate-900">Sign In Required to Report</h3>
           <p className="mt-1 text-xs leading-relaxed text-slate-600">
             Guest uploads are currently disabled by the system administrator. Sign in with a
-            registered or demo account to publish directly.
+            registered account to publish directly.
           </p>
           <button
             type="button"
@@ -709,7 +774,7 @@ export function ReportIncidentModal({
                 maxLength={200}
                 value={title}
                 onChange={(e) => setTitle(e.target.value)}
-                placeholder="e.g., Landslide blocking A7 lane"
+                placeholder="e.g., Landslide blocking main highway lane"
                 className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/20"
               />
             </div>
@@ -757,7 +822,7 @@ export function ReportIncidentModal({
             {/* Place Search + In-Modal GPS */}
             <div className="relative">
               <label htmlFor={searchId} className="mb-1 block text-[11px] font-bold text-slate-600">
-                Search town, road, or landmark to move map pin
+                Search street, neighborhood, town, or landmark
               </label>
               <div className="flex flex-wrap gap-2">
                 <div className="relative min-w-[200px] flex-1">
@@ -784,7 +849,7 @@ export function ReportIncidentModal({
                         void runPlaceSearch(placeQuery);
                       }
                     }}
-                    placeholder="Search Gampaha, Ella Rock, Kandy Road..."
+                    placeholder="Search street, town, or landmark..."
                     className="w-full rounded-xl border border-slate-200 bg-white py-2 pl-8 pr-8 text-xs text-slate-900 focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/20"
                   />
                   {searchingPlaces ? (
@@ -807,7 +872,7 @@ export function ReportIncidentModal({
 
                 <button
                   type="button"
-                  onClick={handleDetectGpsInModal}
+                  onClick={() => detectGpsInModal()}
                   disabled={detectingGps}
                   className="inline-flex items-center gap-1.5 rounded-xl border border-sky-200 bg-sky-50 px-3 py-2 text-xs font-bold text-sky-800 transition hover:bg-sky-100 disabled:opacity-60"
                 >
@@ -816,7 +881,7 @@ export function ReportIncidentModal({
                   ) : (
                     <Crosshair className="h-3.5 w-3.5 text-sky-600" aria-hidden="true" />
                   )}
-                  <span>{detectingGps ? 'Locating...' : 'Use My GPS'}</span>
+                  <span>{detectingGps ? 'Locating...' : 'Use Live GPS'}</span>
                 </button>
               </div>
 
@@ -864,6 +929,32 @@ export function ReportIncidentModal({
               />
             ) : null}
 
+            {/* Structured Google-Maps-Style Address Breakdown */}
+            {addressFields.length > 0 ? (
+              <div className="rounded-xl border border-slate-200 bg-white p-2.5">
+                <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                  <span className="font-bold text-slate-700">Detected Address Details</span>
+                  {resolvedDetails?.place_type ? (
+                    <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-bold capitalize text-slate-600">
+                      {resolvedDetails.place_type}
+                    </span>
+                  ) : null}
+                </div>
+                <div className="grid grid-cols-2 gap-1.5 text-[11px] sm:grid-cols-3">
+                  {addressFields.map((item) => (
+                    <div key={item.label} className="min-w-0 rounded-lg bg-slate-50 px-2 py-1">
+                      <span className="block text-[9px] font-semibold uppercase tracking-wide text-slate-400">
+                        {item.label}
+                      </span>
+                      <span className="block truncate font-semibold text-slate-800">
+                        {item.value}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+
             {/* Live Accuracy / Pin Status Banner */}
             <div role="status" aria-live="polite" className="space-y-1.5">
               {locationSource === 'default' ? (
@@ -873,13 +964,8 @@ export function ReportIncidentModal({
                     aria-hidden="true"
                   />
                   <div>
-                    <span className="font-bold">
-                      {isAtCountryCenter
-                        ? 'Pin is still at the default Sri Lanka center (7.45, 80.55).'
-                        : 'Pin is using the map preset center.'}
-                    </span>{' '}
-                    Search a place above, click the map, or press{' '}
-                    <span className="font-semibold">Use My GPS</span> for an accurate pin.
+                    <span className="font-bold">Waiting for exact location pin.</span> Search a place
+                    above, click the map, or press <span className="font-semibold">Use Live GPS</span>.
                   </div>
                 </div>
               ) : isCoarseGps && gpsAccuracy !== null ? (
@@ -890,7 +976,7 @@ export function ReportIncidentModal({
                   />
                   <div>
                     <span className="font-bold">
-                      Approximate GPS (±{formatAccuracyLabel(gpsAccuracy)})
+                      Approximate GPS ({formatAccuracyMeters(gpsAccuracy)})
                     </span>{' '}
                     — drag the pin or search the exact place on the map. ·{' '}
                     <span className="font-mono">
@@ -904,7 +990,7 @@ export function ReportIncidentModal({
                     <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" aria-hidden="true" />
                     Exact pin locked ({SOURCE_LABELS[locationSource]}
                     {locationSource === 'gps' && gpsAccuracy !== null
-                      ? ` ±${formatAccuracyLabel(gpsAccuracy)}`
+                      ? ` ${formatAccuracyMeters(gpsAccuracy)}`
                       : ''}
                     ) ·{' '}
                     <span className="font-mono">
@@ -957,7 +1043,7 @@ export function ReportIncidentModal({
                       locationNameAutoFilledRef.current = false;
                       setLocationName(e.target.value);
                     }}
-                    placeholder="e.g., Gampaha Town"
+                    placeholder="Resolved place or street"
                     className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 focus:border-sky-500 focus:outline-none"
                   />
                   <button

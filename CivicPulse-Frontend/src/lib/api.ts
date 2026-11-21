@@ -1,7 +1,11 @@
 import type {
+  AdminDatabaseOverview,
   AdminSettings,
+  AdminUserSummary,
   AiChatResponse,
   AuthSession,
+  AuthStatusResponse,
+  ChatHistoryTurn,
   CreatePostRequest,
   CurrentUser,
   GeocodeSuggestion,
@@ -11,6 +15,7 @@ import type {
   PagedPostsResponse,
   Post,
   ReverseGeocodeResponse,
+  UserRole,
 } from '../types/civicpulse';
 
 const AUTH_STORAGE_KEY = 'civicpulse_auth_session_v1';
@@ -83,7 +88,7 @@ export function resolveMediaUrl(mediaUrl: string | null): string | null {
 }
 
 interface RequestOptions {
-  method?: 'GET' | 'POST';
+  method?: 'GET' | 'POST' | 'DELETE';
   body?: unknown;
   token?: string | null;
   timeoutMs?: number;
@@ -254,13 +259,19 @@ export const apiClient = {
     return data;
   },
 
-  async aiChat(message: string, userLat?: number, userLng?: number): Promise<AiChatResponse> {
+  async aiChat(
+    message: string,
+    userLat?: number,
+    userLng?: number,
+    history?: ChatHistoryTurn[],
+  ): Promise<AiChatResponse> {
     const { data } = await requestJson<AiChatResponse>('/api/ai/chat', {
       method: 'POST',
       body: {
         message,
         user_lat: userLat,
         user_lng: userLng,
+        ...(history && history.length > 0 ? { history } : {}),
       },
       timeoutMs: 30_000,
     });
@@ -381,6 +392,69 @@ export const apiClient = {
       timeoutMs: 8_000,
       signal,
     });
+    return data;
+  },
+
+  async getAuthStatus(): Promise<AuthStatusResponse> {
+    const { data } = await requestJson<AuthStatusResponse>('/api/auth/status', { retries: 1 });
+    return data;
+  },
+
+  async changePassword(
+    token: string,
+    currentPassword: string,
+    newPassword: string,
+  ): Promise<{ password_updated: boolean }> {
+    const { data } = await requestJson<{ password_updated: boolean }>('/api/auth/change-password', {
+      method: 'POST',
+      body: { current_password: currentPassword, new_password: newPassword },
+      token,
+    });
+    return data;
+  },
+
+  async logoutAllOtherSessions(token: string): Promise<{ revoked_sessions: number }> {
+    const { data } = await requestJson<{ revoked_sessions: number }>('/api/auth/logout-all', {
+      method: 'POST',
+      token,
+    });
+    return data;
+  },
+
+  async getAdminOverview(token: string): Promise<AdminDatabaseOverview> {
+    const { data } = await requestJson<AdminDatabaseOverview>('/api/admin/overview', {
+      token,
+    });
+    return data;
+  },
+
+  async listAdminUsers(token: string): Promise<AdminUserSummary[]> {
+    const { data } = await requestJson<AdminUserSummary[]>('/api/admin/users', {
+      token,
+    });
+    return data;
+  },
+
+  async updateUserRole(token: string, userId: string, role: UserRole): Promise<AdminUserSummary> {
+    const { data } = await requestJson<AdminUserSummary>(
+      `/api/admin/users/${encodeURIComponent(userId)}/role`,
+      {
+        method: 'POST',
+        body: { role },
+        token,
+      },
+    );
+    return data;
+  },
+
+  async deletePostAsAdmin(token: string, postId: string): Promise<{ deleted: boolean; id: string }> {
+    const { data } = await requestJson<{ deleted: boolean; id: string }>(
+      `/api/admin/posts/${encodeURIComponent(postId)}`,
+      {
+        method: 'DELETE',
+        token,
+      },
+    );
     return data;
   },
 };

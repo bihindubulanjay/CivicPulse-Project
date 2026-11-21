@@ -3,18 +3,41 @@ use axum::{
     http::HeaderMap,
     Json,
 };
+use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{AppError, AppResult},
-    models::{Post, VerificationStatus},
-    services::webhook::maybe_dispatch_emergency_webhook,
+    models::{AdminUserSummary, DbOverviewCounts, Post, VerificationStatus},
+    services::{auth::UserRole, webhook::maybe_dispatch_emergency_webhook},
     state::AppState,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminSettingsPayload {
     pub allow_guest_uploads: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateUserRolePayload {
+    pub role: UserRole,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminOverviewResponse {
+    pub database_engine: &'static str,
+    pub database_path: String,
+    pub counts: DbOverviewCounts,
+    pub allow_guest_uploads: bool,
+    pub strict_unique_voters: bool,
+    pub geofence_radius_km: f64,
+    pub gemini_configured: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeletePostResponse {
+    pub deleted: bool,
+    pub id: String,
 }
 
 /// `GET /api/admin/settings` (Admin only) — read persisted guest upload policy.
@@ -49,6 +72,60 @@ pub async fn update_settings(
     Ok(Json(AdminSettingsPayload {
         allow_guest_uploads: state.guest_uploads_allowed(),
     }))
+}
+
+/// `GET /api/admin/overview` (Admin only) — return live SQLite database & table overview.
+pub async fn get_overview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<AdminOverviewResponse>> {
+    state.auth.require_admin(&headers).await?;
+    let now_iso = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let counts = state.repo.get_admin_database_overview(&now_iso).await?;
+    Ok(Json(AdminOverviewResponse {
+        database_engine: "SQLite (WAL + FTS5)",
+        database_path: state.config.database_path.clone(),
+        counts,
+        allow_guest_uploads: state.guest_uploads_allowed(),
+        strict_unique_voters: state.config.strict_unique_voters,
+        geofence_radius_km: state.config.geofence_radius_km,
+        gemini_configured: state.gemini.is_configured(),
+    }))
+}
+
+/// `GET /api/admin/users` (Admin only) — list registered accounts & live activity counts.
+pub async fn list_users(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<Vec<AdminUserSummary>>> {
+    state.auth.require_admin(&headers).await?;
+    let now_iso = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let users = state.repo.list_users_with_stats(&now_iso).await?;
+    Ok(Json(users))
+}
+
+/// `POST /api/admin/users/{id}/role` (Admin only) — promote/demote user role safely.
+pub async fn update_user_role(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateUserRolePayload>,
+) -> AppResult<Json<AdminUserSummary>> {
+    let admin = state.auth.require_admin(&headers).await?;
+    let now_iso = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let updated = state
+        .repo
+        .update_user_role(&id, payload.role, &now_iso)
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("User '{id}' not found")))?;
+
+    tracing::info!(
+        admin = %admin.email,
+        target_user_id = %id,
+        new_role = payload.role.as_str(),
+        "Updated user role"
+    );
+    Ok(Json(updated))
 }
 
 /// `GET /api/admin/pending` (Admin only) — returns `Pending Admin Approval`, `Quarantined`, and `Disputed` posts.
@@ -109,4 +186,30 @@ pub async fn reject_post(
         .ok_or_else(|| AppError::not_found(format!("Post '{id}' not found")))?;
     state.publish_redacted_event("post_rejected", &updated);
     Ok(Json(updated))
+}
+
+/// `DELETE /api/admin/posts/{id}` (Admin only) — permanently delete a report and its FTS/audit/comment rows.
+pub async fn delete_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> AppResult<Json<DeletePostResponse>> {
+    let admin = state.auth.require_admin(&headers).await?;
+    let deleted = state
+        .repo
+        .delete_post(&id)
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("Post '{id}' not found")))?;
+
+    tracing::info!(
+        admin = %admin.email,
+        post_id = %deleted.id,
+        title = %deleted.title,
+        "Admin permanently deleted report"
+    );
+    state.publish_redacted_event("post_deleted", &deleted);
+    Ok(Json(DeletePostResponse {
+        deleted: true,
+        id: deleted.id,
+    }))
 }
