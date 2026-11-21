@@ -100,6 +100,12 @@ export function TopNavBar({
   onOpenReport,
 }: TopNavBarProps) {
   const locating = gpsStatus === 'locating';
+  const baseUrl = import.meta.env.BASE_URL || '/';
+  const landingUrl =
+    (import.meta.env as { VITE_LANDING_URL?: string }).VITE_LANDING_URL ||
+    (baseUrl.includes('/console')
+      ? baseUrl.replace(/console\/?$/, '') || '/'
+      : 'http://localhost:3000/');
   const gpsSummary = liveLocationLabel
     ? userCoords?.accuracy !== undefined && Number.isFinite(userCoords.accuracy)
       ? `${liveLocationLabel} (${formatAccuracyMeters(userCoords.accuracy)})`
@@ -114,7 +120,11 @@ export function TopNavBar({
         {/* Primary Row: Branding, Search, Live GPS, Auth & Report CTA */}
         <div className="flex flex-wrap items-center gap-2.5 lg:gap-3">
           {/* Brand */}
-          <div className="flex items-center gap-2.5 pr-1">
+          <a
+            href={landingUrl}
+            title="Back to CivicPulse Landing Page"
+            className="flex items-center gap-2.5 pr-1 rounded-xl transition hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
+          >
             <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-emerald-500 via-sky-500 to-indigo-600 text-white shadow-sm">
               <Sparkles className="h-5 w-5" aria-hidden="true" />
             </div>
@@ -149,7 +159,7 @@ export function TopNavBar({
                 Zero-Fake Safety &amp; Eco-Tourism Console
               </p>
             </div>
-          </div>
+          </a>
 
           {/* Search Bar */}
           <div className="relative min-w-[200px] flex-1 max-w-md">

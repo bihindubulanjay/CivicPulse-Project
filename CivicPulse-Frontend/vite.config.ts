@@ -3,8 +3,11 @@ import react from '@vitejs/plugin-react';
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, '.', 'VITE_');
+  const cliProcessEnv = (
+    globalThis as { process?: { env?: Record<string, string | undefined> } }
+  ).process?.env;
   return {
-    base: env.VITE_BASE_PATH || '/',
+    base: cliProcessEnv?.VITE_BASE_PATH || env.VITE_BASE_PATH || '/',
     plugins: [react()],
     server: {
       port: 3001,

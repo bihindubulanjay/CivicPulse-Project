@@ -1,7 +1,8 @@
 'use client';
 
 import React, { useEffect, useState } from 'react';
-import { Sun, Moon, Radio, Video } from 'lucide-react';
+import { Sun, Moon, ArrowUpRight } from 'lucide-react';
+import { CONSOLE_URL } from '@/lib/consoleUrl';
 
 interface NavbarProps {
   onOpenReport: () => void;
@@ -133,6 +134,15 @@ export default function Navbar({ onOpenReport, theme, onToggleTheme }: NavbarPro
               <Moon className="w-4 h-4 text-slate-800" />
             )}
           </button>
+
+          {/* Launch Console CTA */}
+          <a
+            href={CONSOLE_URL}
+            className="flex items-center gap-1.5 px-3.5 py-2 bg-gradient-to-r from-[var(--accent-emerald)] to-[var(--accent-cyan)] text-white rounded-md text-xs font-bold tracking-wider hover:opacity-95 transition-all shadow-[var(--shadow-glow)]"
+          >
+            <span>Launch Console</span>
+            <ArrowUpRight className="w-3.5 h-3.5" />
+          </a>
 
           {/* LIVE REC Modal Opener */}
           <button

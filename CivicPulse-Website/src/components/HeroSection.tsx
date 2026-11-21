@@ -2,6 +2,7 @@
 
 import React, { useEffect, useRef, useState } from 'react';
 import { ArrowRight, ShieldCheck, Layers, Activity, AlertTriangle, Compass } from 'lucide-react';
+import { CONSOLE_URL } from '@/lib/consoleUrl';
 
 interface HeroSectionProps {
   theme: 'dark' | 'light';
@@ -428,14 +429,20 @@ export default function HeroSection({ theme }: HeroSectionProps) {
           multilingual authenticity quarantine across monsoons, landslides, and eco-trails.
         </p>
 
-        {/* Dual CTAs */}
+        {/* Primary Console CTA & Secondary Actions */}
         <div className="flex flex-wrap items-center gap-4 mb-8">
           <a
-            href="#feed"
+            href={CONSOLE_URL}
             className="inline-flex items-center gap-2 px-6 py-3 bg-gradient-to-r from-[var(--accent-emerald)] to-emerald-600 text-white rounded-lg font-bold text-sm shadow-[var(--shadow-glow)] hover:-translate-y-0.5 transition-all"
           >
-            <span>Explore Live Hazard Grid</span>
+            <span>Launch Live Console</span>
             <ArrowRight className="w-4 h-4" />
+          </a>
+          <a
+            href="#feed"
+            className="inline-flex items-center gap-2 px-6 py-3 bg-[var(--bg-card)] backdrop-blur-md text-[var(--text-primary)] border border-[var(--border-medium)] rounded-lg font-semibold text-sm hover:border-[var(--accent-emerald)] hover:-translate-y-0.5 transition-all"
+          >
+            <span>Explore Live Hazard Grid</span>
           </a>
           <a
             href="#engine"

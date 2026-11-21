@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useEffect, useRef, useState } from 'react';
+import { CONSOLE_URL } from '@/lib/consoleUrl';
 
 interface PreloaderProps {
   onComplete: () => void;
@@ -866,6 +867,13 @@ export default function Preloader({ onComplete }: PreloaderProps) {
             <span className={`pulse-dot ${isThermalFLIR ? 'bg-red-500' : 'bg-cyan-400'}`}></span>
             <span>{isThermalFLIR ? 'OPTICAL CAM [T]' : 'THERMAL FLIR [T]'}</span>
           </button>
+
+          <a
+            href={CONSOLE_URL}
+            className="px-4 py-1.5 bg-[#0D141F]/85 backdrop-blur-md border border-emerald-500/60 hover:bg-emerald-500 hover:text-white text-emerald-300 rounded text-xs font-semibold tracking-wider transition-all mono flex items-center gap-1.5 shadow-[0_0_15px_rgba(16,185,129,0.25)]"
+          >
+            <span>OPEN CONSOLE ↗</span>
+          </a>
 
           <button
             onClick={handleFinish}

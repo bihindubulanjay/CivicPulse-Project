@@ -1,5 +1,6 @@
 import React from 'react';
 import { PhoneCall, ShieldAlert, HeartHandshake, Shield, AlertCircle } from 'lucide-react';
+import { CONSOLE_URL } from '@/lib/consoleUrl';
 
 export default function Footer() {
   return (
@@ -132,7 +133,15 @@ export default function Footer() {
             <ul className="flex flex-col gap-2.5 text-xs">
               <li>
                 <a
-                  href="https://github.com"
+                  href={CONSOLE_URL}
+                  className="font-semibold text-[var(--accent-emerald)] hover:underline transition-colors"
+                >
+                  Launch Live Console
+                </a>
+              </li>
+              <li>
+                <a
+                  href="https://github.com/bihindubulanjay/CivicPulse-Project"
                   target="_blank"
                   rel="noopener noreferrer"
                   className="hover:text-[var(--accent-emerald)] transition-colors"
