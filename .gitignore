@@ -1,0 +1,23 @@
+# Secrets & Environment files
+.env
+.env.*
+!.env.example
+!**/.env.example
+
+# Rust build artifacts
+**/target/
+
+# Node / Next.js frontend & CLI build artifacts
+**/node_modules/
+**/.next/
+**/out/
+
+# Local databases, uploads & OS junk
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+**/data/uploads/
+.DS_Store
+*.log
